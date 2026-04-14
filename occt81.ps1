@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    DiagSystem — Outil de diagnostic universel Windows
+    occt81 — Outil de diagnostic universel Windows
 
 .DESCRIPTION
     Teste RAM, latence CPU, erreurs WHEA, temperature, disques, GPU et uptime.
@@ -35,19 +35,19 @@
     Taille du buffer RAM en Mo (defaut : 20)
 
 .EXAMPLE
-    .\DiagSystem.ps1
+    .\occt81.ps1
     Lance le diagnostic complet en mode CLI.
 
 .EXAMPLE
-    .\DiagSystem.ps1 -GUI
+    .\occt81.ps1 -GUI
     Lance l'interface graphique.
 
 .EXAMPLE
-    .\DiagSystem.ps1 -Tests "RAM,WHEA" -Export "rapport.html"
+    .\occt81.ps1 -Tests "RAM,WHEA" -Export "rapport.html"
     Teste uniquement RAM et WHEA, exporte en HTML.
 
 .EXAMPLE
-    .\DiagSystem.ps1 -Silent -Export "C:\Logs\diag.csv"
+    .\occt81.ps1 -Silent -Export "C:\Logs\diag.csv"
     Mode silencieux avec export CSV pour tache planifiee.
 
 .NOTES
@@ -79,11 +79,11 @@ $ErrorActionPreference = 'Stop'
 if ($Help) {
     Write-Host @'
 
-  DiagSystem v2.0 — Diagnostic systeme universel Windows
+  occt81 v2.0 — Diagnostic systeme universel Windows
   =======================================================
 
   USAGE
-      .\DiagSystem.ps1 [options]
+      .\occt81.ps1 [options]
 
   OPTIONS
       -GUI                  Interface graphique WPF
@@ -96,10 +96,10 @@ if ($Help) {
       -Man                  Manuel complet (Get-Help)
 
   EXEMPLES
-      .\DiagSystem.ps1
-      .\DiagSystem.ps1 -GUI
-      .\DiagSystem.ps1 -Tests "RAM,WHEA" -Export rapport.html
-      .\DiagSystem.ps1 -Silent -Export C:\Logs\diag.csv
+      .\occt81.ps1
+      .\occt81.ps1 -GUI
+      .\occt81.ps1 -Tests "RAM,WHEA" -Export rapport.html
+      .\occt81.ps1 -Silent -Export C:\Logs\diag.csv
 
 '@ -ForegroundColor Cyan
     exit 0
@@ -439,7 +439,7 @@ function Export-Report {
             $cColor  = if ($crit -gt 0) { '#f87171' } elseif ($warns -gt 0) { '#fbbf24' } else { '#4ade80' }
             $osName  = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
             $html    = @"
-<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><title>DiagSystem</title>
+<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><title>occt81</title>
 <style>body{font-family:Consolas,monospace;background:#0f172a;color:#e2e8f0;margin:0;padding:32px}
 h1{color:#38bdf8;font-size:22px;letter-spacing:2px}.meta{color:#64748b;font-size:13px;margin-bottom:24px}
 table{width:100%;border-collapse:collapse;font-size:14px}
@@ -447,7 +447,7 @@ th{background:#1e293b;color:#475569;padding:10px 14px;text-align:left;font-weigh
 td{padding:8px 14px;border-bottom:1px solid #1e293b}
 .concl{margin-top:24px;padding:14px 20px;border-radius:6px;background:#1e293b;font-size:15px;color:$cColor;font-weight:bold}
 </style></head><body>
-<h1>DIAGSYSTEM v2.0</h1>
+<h1>occt81 v2.0</h1>
 <div class="meta">$env:COMPUTERNAME &nbsp;|&nbsp; $osName &nbsp;|&nbsp; $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')</div>
 <table><tr><th>HEURE</th><th>TEST</th><th>STATUT</th><th>VALEUR</th><th>DETAIL</th></tr>
 $($rows -join "`n")
@@ -458,7 +458,7 @@ $($rows -join "`n")
             [System.IO.File]::WriteAllText($Export, $html, [System.Text.Encoding]::UTF8)
         }
         default {
-            $lines = @("DiagSystem v2.0 — $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')", "Machine : $env:COMPUTERNAME", ('-' * 60))
+            $lines = @("occt81 v2.0 — $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')", "Machine : $env:COMPUTERNAME", ('-' * 60))
             $results | ForEach-Object { $lines += "{0,-26} [{1,-4}]  {2}  {3}" -f $_.Test, $_.Status, $_.Valeur, $_.Detail }
             $lines | Set-Content -Path $Export -Encoding UTF8
         }
@@ -503,7 +503,7 @@ function Show-Gui {
     [xml]$xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="DiagSystem v2.0" Height="680" Width="860"
+        Title="occt81 v2.0" Height="680" Width="860"
         Background="#0f172a" FontFamily="Consolas" WindowStartupLocation="CenterScreen">
   <Window.Resources>
     <Style TargetType="Button" x:Key="Btn">
@@ -553,7 +553,7 @@ function Show-Gui {
     </Grid.RowDefinitions>
     <!-- Titre -->
     <StackPanel Grid.Row="0" Margin="0,0,0,16">
-      <TextBlock Text="DiagSystem v2.0" FontSize="22" FontWeight="Bold" Foreground="#38bdf8"/>
+      <TextBlock Text="occt81 v2.0" FontSize="22" FontWeight="Bold" Foreground="#38bdf8"/>
       <TextBlock x:Name="lblMachine" FontSize="12" Foreground="#475569" Margin="0,4,0,0"/>
     </StackPanel>
     <!-- Checkboxes tests -->
@@ -892,7 +892,7 @@ function Show-Gui {
 if ($GUI) {
     Show-Gui
 } else {
-    Write-Header "DIAGSYSTEM v2.0 — $env:COMPUTERNAME"
+    Write-Header "occt81 v2.0 — $env:COMPUTERNAME"
 
     if (-not $Silent) {
         $osName = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
