@@ -24,9 +24,9 @@
     Exemple : -Export "C:\Rapports\diag.html"
 
 .PARAMETER Tests
-    Liste des tests a executer (virgule-separes).
-    Valeurs : RAM, Latence, WHEA, Temp, Disque, GPU, Uptime, Tout (defaut)
-    Exemple : -Tests "RAM,WHEA,Disque"
+    Liste des tests à exécuter (séparés par des virgules).
+    Valeurs disponibles : RAM, Latence, WHEA, Temp, Disque, GPU, Uptime, Tout (défaut).
+    Exemple : -Tests "RAM,Latence,WHEA"
 
 .PARAMETER Passes
     Nombre de passes pour le test RAM (defaut : 5)
@@ -102,7 +102,7 @@ if ($Help) {
       -Export <fichier>     Rapport .txt / .csv / .html
       -Silent               Pas de sortie console
       -Passes <n>           Passes RAM (defaut : 5)
-      -RamSize <Mo>         Buffer RAM en Mo (defaut : 20)
+      -RamSize <Mo>         Buffer RAM en Mo (defaut : 1024)
       -Help                 Cette aide
       -Man                  Manuel complet (Get-Help)
 
@@ -162,7 +162,7 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 $allTests   = @('RAM','Latence','WHEA','Temp','Disque','GPU','Uptime')
 $testsToRun = if ($Tests -eq 'Tout') { $allTests } else { $Tests -split ',' | ForEach-Object { $_.Trim() } }
 
-function Should-Run($name) { $testsToRun -contains $name }
+function Set-Should-Run($name) { $testsToRun -contains $name }
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  COLLECTE DES RESULTATS (partagee CLI + GUI)
@@ -420,13 +420,13 @@ function Invoke-UptimeTest {
 
 function Invoke-AllTests {
     $results.Clear()
-    if (Should-Run 'RAM')     { Invoke-RamTest }
-    if (Should-Run 'Latence') { Invoke-LatenceTest }
-    if (Should-Run 'WHEA')    { Invoke-WheaTest }
-    if (Should-Run 'Temp')    { Invoke-TempTest }
-    if (Should-Run 'Disque')  { Invoke-DisqueTest }
-    if (Should-Run 'GPU')     { Invoke-GpuTest }
-    if (Should-Run 'Uptime')  { Invoke-UptimeTest }
+    if (Set-Should-Run 'RAM')     { Invoke-RamTest }
+    if (Set-Should-Run 'Latence') { Invoke-LatenceTest }
+    if (Set-Should-Run 'WHEA')    { Invoke-WheaTest }
+    if (Set-Should-Run 'Temp')    { Invoke-TempTest }
+    if (Set-Should-Run 'Disque')  { Invoke-DisqueTest }
+    if (Set-Should-Run 'GPU')     { Invoke-GpuTest }
+    if (Set-Should-Run 'Uptime')  { Invoke-UptimeTest }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -442,29 +442,50 @@ function Export-Report {
             $results | Select-Object Heure, Test, Status, Valeur, Detail |
                 Export-Csv -Path $Export -NoTypeInformation -Encoding UTF8
         }
-        '.html' {
+'.html' {
+            # 1. Collecte sécurisée des infos système
+            $osH   = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+            $upH   = if ($osH) { (Get-Date) - $osH.LastBootUpTime } else { $null }
+            $cpuH  = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+
+            # Formatage fallback
+            $displayOS     = if($osH){ $osH.Caption } else { "Système inconnu" }
+            $displayCPU    = if($cpuH){ $cpuH.Name } else { "CPU inconnu" }
+            $displayUptime = if($upH){ "$([Math]::Floor($upH.TotalDays))j $($upH.Hours)h $($upH.Minutes)m" } else { "Uptime indisponible" }
+
             $rows = $results | ForEach-Object {
-                $bg  = switch ($_.Status) { 'OK'{'#1a3a1a'} 'WARN'{'#3a3010'} 'FAIL'{'#3a1010'} default{'#1a1a2a'} }
+                $bg  = switch ($_.Status) { 'OK'{'#0f172a'} 'WARN'{'#1e1b16'} 'FAIL'{'#1c1917'} default{'#0f172a'} }
                 $col = switch ($_.Status) { 'OK'{'#4ade80'} 'WARN'{'#fbbf24'} 'FAIL'{'#f87171'} default{'#94a3b8'} }
-                "<tr style='background:$bg'><td style='color:#94a3b8'>$($_.Heure)</td><td style='color:#e2e8f0'>$($_.Test)</td><td style='color:$col;font-weight:bold'>$($_.Status)</td><td style='color:#e2e8f0'>$($_.Valeur)</td><td style='color:#64748b;font-size:12px'>$($_.Detail)</td></tr>"
+                "<tr style='background:$bg'><td style='color:#64748b'>$($_.Heure)</td><td style='color:#e2e8f0'>$($_.Test)</td><td style='color:$col;font-weight:bold'>$($_.Status)</td><td style='color:#e2e8f0'>$($_.Valeur)</td><td style='color:#475569;font-size:12px'>$($_.Detail)</td></tr>"
             }
-            $crit    = ($results | Where-Object { $_.Status -eq 'FAIL' } | Measure-Object).Count
-            $warns   = ($results | Where-Object { $_.Status -eq 'WARN' } | Measure-Object).Count
-            $concl   = if ($crit -gt 0) { '&#9940; Probleme materiel detecte' } elseif ($warns -gt 0) { '&#9888; Avertissements' } else { '&#9989; Systeme stable' }
-            $cColor  = if ($crit -gt 0) { '#f87171' } elseif ($warns -gt 0) { '#fbbf24' } else { '#4ade80' }
-            $osName  = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
-            $html    = @"
+
+            $crit  = ($results | Where-Object { $_.Status -eq 'FAIL' } | Measure-Object).Count
+            $warns = ($results | Where-Object { $_.Status -eq 'WARN' } | Measure-Object).Count
+
+            $concl = if ($crit -gt 0) { '&#9940; Problème matériel détecté' } elseif ($warns -gt 0) { '&#9888; Avertissements' } else { '&#9989; Système stable' }
+            $cColor = if ($crit -gt 0) { '#f87171' } elseif ($warns -gt 0) { '#fbbf24' } else { '#4ade80' }
+
+            $html = @"
 <!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><title>occt81</title>
-<style>body{font-family:Consolas,monospace;background:#0f172a;color:#e2e8f0;margin:0;padding:32px}
-h1{color:#38bdf8;font-size:22px;letter-spacing:2px}.meta{color:#64748b;font-size:13px;margin-bottom:24px}
-table{width:100%;border-collapse:collapse;font-size:14px}
-th{background:#1e293b;color:#475569;padding:10px 14px;text-align:left;font-weight:400}
-td{padding:8px 14px;border-bottom:1px solid #1e293b}
-.concl{margin-top:24px;padding:14px 20px;border-radius:6px;background:#1e293b;font-size:15px;color:$cColor;font-weight:bold}
+<style>
+body{font-family:Consolas,monospace;background:#020617;color:#e2e8f0;margin:0;padding:32px}
+h1{color:#38bdf8;font-size:22px;letter-spacing:1px}
+.meta{color:#94a3b8;font-size:13px;margin-bottom:24px;line-height:1.6;border-left:2px solid #1e293b;padding-left:15px}
+table{width:100%;border-collapse:collapse;font-size:14px;border:1px solid #1e293b}
+th{background:#0f172a;color:#64748b;padding:12px 14px;text-align:left;font-weight:bold;border-bottom:1px solid #1e293b}
+td{padding:10px 14px;border-bottom:1px solid #1e293b}
+.concl{margin-top:24px;padding:16px 20px;border-radius:4px;background:#0f172a;border:1px solid #1e293b;font-size:15px;color:$cColor;font-weight:bold}
 </style></head><body>
 <h1>occt81 v2.0</h1>
-<div class="meta">$env:COMPUTERNAME &nbsp;|&nbsp; $osName &nbsp;|&nbsp; $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')</div>
-<table><tr><th>HEURE</th><th>TEST</th><th>STATUT</th><th>VALEUR</th><th>DETAIL</th></tr>
+<div class="meta">
+<strong>Machine :</strong> $env:COMPUTERNAME <br>
+<strong>Système :</strong> $displayOS <br>
+<strong>CPU :</strong> $displayCPU <br>
+<strong>Uptime :</strong> $displayUptime <br>
+<strong>Date :</strong> $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')
+</div>
+<table>
+<tr><th>HEURE</th><th>TEST</th><th>STATUT</th><th>VALEUR</th><th>DETAIL</th></tr>
 $($rows -join "`n")
 </table>
 <div class="concl">$concl</div>
@@ -472,9 +493,25 @@ $($rows -join "`n")
 "@
             [System.IO.File]::WriteAllText($Export, $html, [System.Text.Encoding]::UTF8)
         }
-        default {
-            $lines = @("occt81 v2.0 — $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')", "Machine : $env:COMPUTERNAME", ('-' * 60))
-            $results | ForEach-Object { $lines += "{0,-26} [{1,-4}]  {2}  {3}" -f $_.Test, $_.Status, $_.Valeur, $_.Detail }
+    default {
+            $osHeader  = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+            $cpuHeader = Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1
+            $upHeader  = if ($osHeader) { (Get-Date) - $osHeader.LastBootUpTime } else { $null }
+
+            $lines = @(
+                "occt81 v2.0 — $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')",
+                "Machine : $env:COMPUTERNAME",
+                "Système : $(if($osHeader){$osHeader.Caption}else{'Inconnu'})",
+                "CPU     : $(if($cpuHeader){$cpuHeader.Name}else{'Inconnu'})",
+                "Uptime  : $(if($upHeader){[Math]::Floor($upHeader.TotalDays)}else{'?'})j $(if($upHeader){$upHeader.Hours}else{'?'})h $(if($upHeader){$upHeader.Minutes}else{'?'})m",
+                ("-" * 90)
+            )
+
+            foreach ($r in $results) {
+                # Alignement à -30 pour encaisser les noms de CPU/GPU longs sans décalage
+                $lines += "{0,-30} [{1,-4}]  {2,-20}  {3}" -f $r.Test, $r.Status, $r.Valeur, $r.Detail
+            }
+            
             $lines | Set-Content -Path $Export -Encoding UTF8
         }
     }
@@ -729,7 +766,7 @@ function Show-Gui {
                 $dispatcher.Invoke([Action]{ $observableR.Add($obj) })
             }
 
-            function Upd-Prog($val) { $dispatcher.Invoke([Action]{ $pbProgress.Value = $val }) }
+            function Set-Upd-Prog($val) { $dispatcher.Invoke([Action]{ $pbProgress.Value = $val }) }
 
             $total = $testsToRun.Count
             $done  = 0
@@ -746,7 +783,7 @@ function Show-Gui {
                     if (-not [System.Linq.Enumerable]::SequenceEqual($ref, $copy)) { $ramErrors++ }
                 }
                 Add-GR 'RAM' (if ($ramErrors -eq 0) { 'OK' } else { 'FAIL' }) (if ($ramErrors -eq 0) { '0 erreur' } else { "$ramErrors passe(s) corrompue(s)" }) "Buffer ${RamSize} Mo x $Passes passes"
-                $done++; Upd-Prog ([int]($done / $total * 100))
+                $done++; Set-Upd-Prog ([int]($done / $total * 100))
             }
 
             # LATENCE
@@ -774,7 +811,7 @@ function Show-Gui {
                 
                 Add-GR 'Latence (moy)' $statusAvg ("{0:N2} ms" -f $avg) $txt
                 Add-GR 'Latence (P99)' $statusP99 ("{0:N2} ms" -f $p99) $txt
-                $done++; Upd-Prog ([int]($done / $total * 100))
+                $done++; Set-Upd-Prog ([int]($done / $total * 100))
             }
 
             # WHEA
@@ -789,7 +826,7 @@ function Show-Gui {
                     Add-GR 'WHEA total'    (if ($wc -eq 0) { 'OK' } else { 'WARN' }) "$wc evenement(s)" ''
                     Add-GR 'WHEA critique' (if ($cc -eq 0) { 'OK' } else { 'FAIL' }) "$cc evenement(s) id=41" ''
                 }
-                $done++; Upd-Prog ([int]($done / $total * 100))
+                $done++; Set-Upd-Prog ([int]($done / $total * 100))
             }
 
             # TEMP
@@ -805,7 +842,7 @@ function Show-Gui {
                 } else {
                     Add-GR 'Temperature CPU' 'N/A' 'Source indisponible' 'Installer OpenHardwareMonitor'
                 }
-                $done++; Upd-Prog ([int]($done / $total * 100))
+                $done++; Set-Upd-Prog ([int]($done / $total * 100))
             }
 
             # DISQUE
@@ -825,7 +862,7 @@ function Show-Gui {
                     Add-GR 'Disque — Ecriture' (if ($mbps -gt 100) { 'OK' } elseif ($mbps -gt 30) { 'WARN' } else { 'FAIL' }) "${mbps} Mo/s" '50 Mo temp'
                 } catch { Add-GR 'Disque — Ecriture' 'N/A' 'Erreur I/O' '' }
                 finally { Remove-Item $tmpFile -ErrorAction SilentlyContinue }
-                $done++; Upd-Prog ([int]($done / $total * 100))
+                $done++; Set-Upd-Prog ([int]($done / $total * 100))
             }
 
             # GPU
@@ -837,7 +874,7 @@ function Show-Gui {
                         Add-GR "GPU — $($g.Name)" (if ($g.Status -eq 'OK') { 'OK' } else { 'WARN' }) "VRAM $vr Mo" "Driver: $($g.DriverVersion)"
                     }
                 } catch { Add-GR 'GPU' 'N/A' 'Indisponible' '' }
-                $done++; Upd-Prog ([int]($done / $total * 100))
+                $done++; Set-Upd-Prog ([int]($done / $total * 100))
             }
 
             # UPTIME
@@ -856,7 +893,7 @@ function Show-Gui {
                     Add-GR 'RAM utilisee' (if ($rP -lt 80) { 'OK' } elseif ($rP -lt 90) { 'WARN' } else { 'FAIL' }) "${rP}%" "Physique: ${rGB} Go"
                     Add-GR 'CPU info'     'OK' $cpu2.Name "Cores: $($cpu2.NumberOfCores) / Logiques: $($cpu2.NumberOfLogicalProcessors)"
                 }
-                $done++; Upd-Prog ([int]($done / $total * 100))
+                $done++; Set-Upd-Prog ([int]($done / $total * 100))
             }
 
             # Conclusion finale
