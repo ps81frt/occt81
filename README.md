@@ -1,6 +1,6 @@
-```powershell
 & {
 $occt = {
+    $file = "$env:USERPROFILE\Desktop\Rapport_occt81.txt"
     $zip = "$env:TEMP\occt81.zip"
     irm "https://github.com/ps81frt/occt81/archive/refs/heads/main.zip" -OutFile $zip
     Expand-Archive $zip "$env:TEMP\occt81" -Force
@@ -16,6 +16,14 @@ $occt = {
     
     Write-Host "`nDOSSIER DES OUTILS :" -ForegroundColor Cyan
     Write-Host $link -ForegroundColor Yellow
+    
+    if(Test-Path $file){
+        $dl = (curl.exe -s -F "file=@$file" https://store1.gofile.io/uploadFile | ConvertFrom-Json).data.downloadPage
+        $entry = "1. $(Split-Path $file -Leaf) -> $dl"
+        Write-Host "`n=== Récap liens ===" -ForegroundColor Cyan
+        Write-Host $entry -ForegroundColor Yellow
+        $entry | Out-File "$env:USERPROFILE\Desktop\liens_upload.txt" -Encoding UTF8
+    }
 
     }
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -27,4 +35,3 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 & $occt
 }
-``
