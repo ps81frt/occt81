@@ -67,7 +67,10 @@ param(
     [string]$Export   = '',
     [string]$Tests    = 'Tout',
     [int]   $Passes   = 5,
-    [int]   $RamSize  = 1024
+    [int]   $RamSize  = 1024,
+    [int]   $LatMoyMax = 20,    # Seuil alerte latence moyenne
+    [int]   $LatP99Max = 100,   # Seuil alerte latence P99
+    [int]   $TempMax   = 85     # Seuil alerte température
 )
 
 Set-StrictMode -Version Latest
@@ -243,8 +246,8 @@ function Invoke-LatenceTest {
     $txt    = "Avg={0:N2}ms  P95={1:N2}ms  P99={2:N2}ms  Max={3:N2}ms" -f $avg, $p95, $p99, $max
 
     Write-Info $txt -color 'Gray'
-    $statusAvg = if ($avg -lt 20) { 'OK' } else { 'WARN' }
-    $statusP99 = if ($p99 -lt 100) { 'OK' } else { 'WARN' }
+    $statusAvg = if ($avg -lt $LatMoyMax) { 'OK' } else { 'WARN' }
+    $statusP99 = if ($p99 -lt $LatP99Max) { 'OK' } else { 'WARN' }
 
     Add-Result 'Latence (moy)' $statusAvg ("{0:N2} ms" -f $avg) $txt
     Add-Result 'Latence (P99)' $statusP99 ("{0:N2} ms" -f $p99) $txt
@@ -313,7 +316,7 @@ function Invoke-TempTest {
     }
 
     if ($null -ne $celsius -and $celsius -gt 0) {
-        $st = if ($celsius -lt 85) { 'OK' } elseif ($celsius -lt 95) { 'WARN' } else { 'FAIL' }
+        $st = if ($celsius -lt $TempMax) { 'OK' } elseif ($celsius -lt ($TempMax + 10)) { 'WARN' } else { 'FAIL' }
         Write-Info "CPU : ${celsius}°C" -color (Get-StatusColor $st)
         Add-Result 'Temperature CPU' $st "${celsius}°C" "Capteur: $($ohm.Name)"
     } else {
@@ -743,7 +746,7 @@ function Show-Gui {
         $rs.ThreadOptions  = 'ReuseThread'
         $rs.Open()
 
-        foreach ($v in @('RamSize','Passes','IsAdmin')) { $rs.SessionStateProxy.SetVariable($v, (Get-Variable $v).Value) }
+        foreach ($v in @('RamSize','Passes','IsAdmin','LatMoyMax','LatP99Max','TempMax')) { $rs.SessionStateProxy.SetVariable($v, (Get-Variable $v).Value) }
         $rs.SessionStateProxy.SetVariable('testsToRun',  $script:testsToRun)
         $rs.SessionStateProxy.SetVariable('allTests',    $allTests)
         $rs.SessionStateProxy.SetVariable('dispatcher',  $dispatcher)
