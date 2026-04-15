@@ -32,7 +32,7 @@
     Nombre de passes pour le test RAM (defaut : 5)
 
 .PARAMETER RamSize
-    Taille du buffer RAM en Mo (defaut : 20)
+    Taille du buffer RAM en Mo (defaut : 1024)
 
 .EXAMPLE
     .\occt81.ps1
@@ -57,6 +57,7 @@
               Le script fonctionne sans admin mais ces tests seront marques N/A.
 #>
 
+
 [CmdletBinding()]
 param(
     [switch]$Help,
@@ -66,11 +67,21 @@ param(
     [string]$Export   = '',
     [string]$Tests    = 'Tout',
     [int]   $Passes   = 5,
-    [int]   $RamSize  = 20
+    [int]   $RamSize  = 1024
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UAC
+# ─────────────────────────────────────────────────────────────────────────────
+
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile","-ExecutionPolicy","Bypass","-File",$PSCommandPath -Verb RunAs
+    exit
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  AIDE
@@ -178,20 +189,29 @@ function Invoke-RamTest {
     $size      = [int]($RamSize * 1MB)
     $ramErrors = 0
     $rng       = [System.Random]::new()
-    $ref       = [byte[]]::new($size)
+    
+    # On pré-alloue pour éviter les lags d'allocation durant le test
+    $ref = [byte[]]::new($size)
     $rng.NextBytes($ref)
 
     for ($i = 1; $i -le $Passes; $i++) {
         Write-Info "Pass $i/$Passes..." -color 'DarkGray'
+        
+        # Force le nettoyage mémoire pour éviter les faux positifs de swap
+        [System.GC]::Collect()
+        [System.GC]::WaitForPendingFinalizers()
+
         $copy = [byte[]]::new($size)
         [Array]::Copy($ref, $copy, $size)
-        for ($j = 0; $j -lt $size; $j++) {
-            if ($copy[$j] -ne $ref[$j]) { $ramErrors++ }
+
+        # Comparaison ultra-rapide via .NET LINQ au lieu d'une boucle PowerShell
+        if (-not [System.Linq.Enumerable]::SequenceEqual($ref, $copy)) {
+            $ramErrors++
         }
     }
 
     $st = if ($ramErrors -eq 0) { 'OK' } else { 'FAIL' }
-    $v  = if ($ramErrors -eq 0) { '0 erreur' } else { "$ramErrors erreur(s)" }
+    $v  = if ($ramErrors -eq 0) { '0 erreur' } else { "$ramErrors passe(s) corrompue(s)" }
     Write-Info "Resultat : $v" -color (Get-StatusColor $st)
     Add-Result 'RAM' $st $v "Buffer ${RamSize} Mo x $Passes passes"
 }
@@ -209,7 +229,7 @@ function Invoke-LatenceTest {
     for ($i = 0; $i -lt $samples; $i++) {
         $sw.Restart()
         $x = 0
-        for ($j = 0; $j -lt 15000; $j++) { $x = $x -bxor ($j * 7) }
+        for ($j = 0; $j -lt 50000; $j++) { $x = $x -bxor ($j * 7) }
         $sw.Stop()
         $lat[$i] = $sw.Elapsed.TotalMilliseconds
     }
@@ -229,7 +249,6 @@ function Invoke-LatenceTest {
     Add-Result 'Latence (moy)' $statusAvg ("{0:N2} ms" -f $avg) $txt
     Add-Result 'Latence (P99)' $statusP99 ("{0:N2} ms" -f $p99) $txt
 }
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  TEST 3 — WHEA
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,41 +291,36 @@ function Invoke-WheaTest {
 
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  TEST 4 — TEMPERATURE CPU
-# ─────────────────────────────────────────────────────────────────────────────
-
 function Invoke-TempTest {
     Write-Section "TEMPERATURE CPU"
     $celsius = $null
 
-    # Methode 1 : WMI ACPI (natif Windows)
     try {
-        $raw     = (Get-CimInstance -Namespace 'root/WMI' -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop |
-                    Select-Object -First 1).CurrentTemperature
-        $celsius = [Math]::Round(($raw - 2732) / 10.0, 1)
+        $raw = (Get-CimInstance -Namespace 'root/WMI' -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop | Select-Object -First 1).CurrentTemperature
+        if ($raw -gt 0) { $celsius = [Math]::Round(($raw - 2732) / 10.0, 1) }
     } catch {}
 
-    # Methode 2 : OpenHardwareMonitor (si installe)
     if ($null -eq $celsius) {
         try {
-            $ohm = Get-CimInstance -Namespace 'root/OpenHardwareMonitor' -ClassName Sensor -ErrorAction Stop |
-                   Where-Object { $_.SensorType -eq 'Temperature' -and $_.Name -match 'CPU' } |
-                   Select-Object -First 1
+            $sensors = Get-CimInstance -Namespace 'root/OpenHardwareMonitor' -ClassName Sensor -ErrorAction Stop | 
+                       Where-Object { $_.SensorType -eq 'Temperature' }
+            
+            $ohm = $sensors | Where-Object { $_.Name -match 'CPU|Package|Core|Tdie|Tctl' } | 
+                   Sort-Object Value -Descending | Select-Object -First 1
+            
             if ($ohm) { $celsius = [Math]::Round($ohm.Value, 1) }
         } catch {}
     }
 
-    if ($null -ne $celsius) {
+    if ($null -ne $celsius -and $celsius -gt 0) {
         $st = if ($celsius -lt 85) { 'OK' } elseif ($celsius -lt 95) { 'WARN' } else { 'FAIL' }
         Write-Info "CPU : ${celsius}°C" -color (Get-StatusColor $st)
-        Add-Result 'Temperature CPU' $st "${celsius}°C" ''
+        Add-Result 'Temperature CPU' $st "${celsius}°C" "Capteur: $($ohm.Name)"
     } else {
-        Write-Info "Non disponible (normal sans driver ACPI/OHM)" -color 'DarkGray'
-        Add-Result 'Temperature CPU' 'N/A' 'Source indisponible' 'Installez OpenHardwareMonitor'
+        Write-Host "  [!] Activez 'WMI Support' dans les options d'OpenHardwareMonitor" -ForegroundColor Yellow
+        Add-Result 'Temperature CPU' 'N/A' 'Source indisponible' 'Lancer OHM en Admin + Option WMI'
     }
 }
-
 # ─────────────────────────────────────────────────────────────────────────────
 #  TEST 5 — DISQUES
 # ─────────────────────────────────────────────────────────────────────────────
@@ -393,7 +407,8 @@ function Invoke-UptimeTest {
                                   else { 'FAIL' }
 
                                   Add-Result 'Uptime' $statusUptime "${days}j $($uptime.Hours)h $($uptime.Minutes)m" "OS: $($os.Caption)"
-                                  Add-Result 'RAM utilisee' $statusRAM "${ramPct}%" "Physique: ${ramGB} Go"        Add-Result 'CPU info'     'OK' $cpu.Name "Cores: $($cpu.NumberOfCores) / Logiques: $($cpu.NumberOfLogicalProcessors)"
+                                  Add-Result 'RAM utilisee' $statusRAM "${ramPct}%" "Physique: ${ramGB} Go"
+                                  Add-Result 'CPU info'     'OK' $cpu.Name "Cores: $($cpu.NumberOfCores) / Logiques: $($cpu.NumberOfLogicalProcessors)"
             } else {
                 Add-Result 'Uptime' 'N/A' 'Indisponible' ''
             }
@@ -475,9 +490,14 @@ $($rows -join "`n")
 
 function Write-Summary {
     Write-Header 'RESUME'
-    $results | ForEach-Object {
-        $color = Get-StatusColor $_.Status
-        Write-Host ("  {0,-26} [{1,-4}]  {2}" -f $_.Test, $_.Status, $_.Valeur) -ForegroundColor $color
+    foreach ($r in $results) {
+        $color = Get-StatusColor $r.Status
+        $name   = $r.Test.PadRight(26)
+        $status = "[$($r.Status.PadRight(4))]"
+        $val    = $r.Valeur.PadRight(12)
+        $detail = if ($r.Detail) { $r.Detail } else { "" }
+        
+        Write-Host "  $name $status  $val  $detail" -ForegroundColor $color
     }
     $bar      = '=' * 50
     $critical = ($results | Where-Object { $_.Status -eq 'FAIL' } | Measure-Object).Count
@@ -719,35 +739,43 @@ function Show-Gui {
                 $size = [int]($RamSize * 1MB); $ramErrors = 0
                 $rng = [System.Random]::new(); $ref = [byte[]]::new($size); $rng.NextBytes($ref)
                 for ($i = 1; $i -le $Passes; $i++) {
-                    $copy = [byte[]]::new($size); [Array]::Copy($ref, $copy, $size)
-                    for ($j = 0; $j -lt $size; $j++) { if ($copy[$j] -ne $ref[$j]) { $ramErrors++ } }
+                    [System.GC]::Collect() 
+                    [System.GC]::WaitForPendingFinalizers()
+                    $copy = [byte[]]::new($size)
+                    [Array]::Copy($ref, $copy, $size)
+                    if (-not [System.Linq.Enumerable]::SequenceEqual($ref, $copy)) { $ramErrors++ }
                 }
-                Add-GR 'RAM' (if ($ramErrors -eq 0) { 'OK' } else { 'FAIL' }) (if ($ramErrors -eq 0) { '0 erreur' } else { "$ramErrors erreur(s)" }) "Buffer ${RamSize} Mo x $Passes passes"
+                Add-GR 'RAM' (if ($ramErrors -eq 0) { 'OK' } else { 'FAIL' }) (if ($ramErrors -eq 0) { '0 erreur' } else { "$ramErrors passe(s) corrompue(s)" }) "Buffer ${RamSize} Mo x $Passes passes"
                 $done++; Upd-Prog ([int]($done / $total * 100))
             }
 
             # LATENCE
             if ($testsToRun -contains 'Latence') {
+                $warmup = [System.Diagnostics.Stopwatch]::StartNew()
+                while($warmup.ElapsedMilliseconds -lt 300) { $null = 1 + 1 }
+                $warmup.Stop()
+
                 $samples = 200; $lat = [double[]]::new($samples)
                 $sw = [System.Diagnostics.Stopwatch]::new()
                 for ($i = 0; $i -lt $samples; $i++) {
                     $sw.Restart(); $x = 0
-                    for ($j = 0; $j -lt 15000; $j++) { $x = $x -bxor ($j * 7) }
+                    for ($j = 0; $j -lt 50000; $j++) { $x = $x -bxor ($j * 7) } # Charge augmentée
                     $sw.Stop(); $lat[$i] = $sw.Elapsed.TotalMilliseconds
                 }
                 $avg    = ($lat | Measure-Object -Average).Average
                 $sorted = $lat | Sort-Object
                 $p95    = $sorted[[Math]::Min([int]($samples * 0.95), $samples - 1)]
                 $p99    = $sorted[[Math]::Min([int]($samples * 0.99), $samples - 1)]
-                $txt    = "Avg={0:N2}ms P95={1:N2}ms P99={2:N2}ms" -f $avg, $p95, $p99
+                $max    = ($lat | Measure-Object -Maximum).Maximum
+                $txt    = "Avg={0:N2}ms P95={1:N2}ms P99={2:N2}ms Max={3:N2}ms" -f $avg, $p95, $p99, $max
                 
-                $statusAvg = if ($avg -lt 20) { 'OK' } else { 'WARN' }
-                $statusP99 = if ($p99 -lt 100) { 'OK' } else { 'WARN' }
+                $statusAvg = if ($avg -lt 10) { 'OK' } else { 'WARN' }
+                $statusP99 = if ($p99 -lt 30) { 'OK' } else { 'WARN' }
+                
                 Add-GR 'Latence (moy)' $statusAvg ("{0:N2} ms" -f $avg) $txt
-                Add-GR 'Latence (P99)' $statusP99 ("{0:N2} ms" -f $p99) $txt               $done++; Upd-Prog ([int]($done / $total * 100))
-                 
-               
-           }
+                Add-GR 'Latence (P99)' $statusP99 ("{0:N2} ms" -f $p99) $txt
+                $done++; Upd-Prog ([int]($done / $total * 100))
+            }
 
             # WHEA
             if ($testsToRun -contains 'WHEA') {
@@ -824,7 +852,7 @@ function Show-Gui {
                     $rU   = [Math]::Round(($os2.TotalVisibleMemorySize-$os2.FreePhysicalMemory)/1MB,1)
                     $rT   = [Math]::Round($os2.TotalVisibleMemorySize/1MB,1)
                     $rP   = [Math]::Round($rU/$rT*100,1)
-                    Add-GR 'Uptime'       (if ($days -lt 30) { 'OK' } else { 'WARN' }) "${days}j $($up.Hours)h $($up.Minutes)m" $os2.Caption
+                    Add-GR 'Uptime' (if ($days -lt 30) { 'OK' } else { 'WARN' }) "${days}j $($up.Hours)h $($up.Minutes)m" "OS: $($os2.Caption)"
                     Add-GR 'RAM utilisee' (if ($rP -lt 80) { 'OK' } elseif ($rP -lt 90) { 'WARN' } else { 'FAIL' }) "${rP}%" "Physique: ${rGB} Go"
                     Add-GR 'CPU info'     'OK' $cpu2.Name "Cores: $($cpu2.NumberOfCores) / Logiques: $($cpu2.NumberOfLogicalProcessors)"
                 }
