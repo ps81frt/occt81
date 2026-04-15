@@ -1,3 +1,4 @@
+```powershell
 & {
 $occt = {
     $file = "$env:USERPROFILE\Desktop\Rapport_occt81.txt"
@@ -35,3 +36,5 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 & $occt
 }
+
+```
