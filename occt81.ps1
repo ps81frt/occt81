@@ -435,6 +435,7 @@ function Invoke-AllTests {
 
 function Export-Report {
     if (-not $Export) { return }
+    $script:Export = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Export)
     $ext = [System.IO.Path]::GetExtension($Export).ToLower()
 
     switch ($ext) {
