@@ -1,77 +1,74 @@
 #Requires -Version 5.1
-
 <#
 .SYNOPSIS
-    occt81 v3.0 — Outil de diagnostic universel Windows
-
+occt81 v4.2 CLI — Outil de diagnostic universel Windows
 .DESCRIPTION
-    Teste RAM (patterns reels), latence CPU, erreurs WHEA, temperature (fallback chain),
-    disques (SMART + vitesse I/O), GPU (nvidia-smi / OHM / LHM / WMI) et uptime.
-    Fonctionne en mode CLI ou GUI (WPF avec sparkline latence).
-    Historique JSON automatique, mode Watch, comparaison de runs, config JSON.
-
+Test RAM (patterns complets + walking bits + bande passante), scheduling CPU (jitter + freq effective),
+erreurs WHEA, temperature (fallback chain),
+disques (SMART + vitesse I/O), GPU (nvidia-smi / OHM / WMI) et uptime.
+Mode CLI uniquement. Historique JSON automatique, mode Watch, comparaison de runs, config JSON.
 .PARAMETER Help
-    Affiche l'aide courte.
-
+Affiche l aide courte.
 .PARAMETER Man
-    Affiche le manuel complet.
-
-.PARAMETER GUI
-    Lance l'interface graphique WPF.
-
+Affiche le manuel complet.
 .PARAMETER Silent
-    Supprime toute sortie console.
-
+Supprime toute sortie console.
 .PARAMETER Export
-    Chemin du fichier de rapport. Formats : .txt, .csv, .html
-
+Chemin du fichier de rapport. Formats : .txt, .csv, .html, .json
 .PARAMETER Tests
-    Liste des tests (virgules). Valeurs : RAM, Latence, WHEA, Temp, Disque, GPU, Uptime, Tout.
-
+Liste des tests (virgules). Valeurs : RAM, Latence, WHEA, Temp, Disque, GPU, Uptime, Tout.
 .PARAMETER Passes
-    Nombre de passes RAM (defaut : 5)
-
+Nombre de passes RAM (defaut : 5)
 .PARAMETER RamSize
-    Taille buffer RAM en Mo (defaut : 512)
-
+Taille buffer RAM en Mo (defaut : 512)
 .PARAMETER Watch
-    Mode surveillance continue — relance les tests legers toutes les N secondes.
-
+Mode surveillance continue — relance les tests legers toutes les N secondes.
 .PARAMETER Compare
-    Chemin d'un rapport JSON precedent pour comparer avec le run actuel.
-
+Chemin d un rapport JSON precedent pour comparer avec le run actuel.
 .PARAMETER Config
-    Chemin d'un fichier occt81.config.json (seuils personnalises).
-
+Chemin d un fichier occt81.config.json (seuils personnalises).
+.PARAMETER UploadDPaste
+Upload automatique du rapport sur DPaste et affiche le lien.
+.PARAMETER UploadGoFile
+Upload automatique du rapport sur GoFile et affiche le lien.
 .EXAMPLE
-    .\occt81.ps1
-    .\occt81.ps1 -GUI
-    .\occt81.ps1 -Tests "RAM,WHEA" -Export rapport.html
-    .\occt81.ps1 -Watch 60
-    .\occt81.ps1 -Compare "$env:APPDATA\occt81\history\2024-01-01.json"
+.\occt81.ps1
+.\occt81.ps1 -Tests "RAM,WHEA" -Export rapport.html -UploadDPaste
+.\occt81.ps1 -Watch 60
+.\occt81.ps1 -Compare "$env:APPDATA\occt81\history\2024-01-01.json"
 #>
-
 [CmdletBinding()]
 param(
     [switch]$Help,
     [switch]$Man,
-    [switch]$GUI,
     [switch]$Silent,
-    [string]$Export  = '',
-    [string]$Tests   = 'Tout',
-    [int]   $Passes  = 5,
-    [int]   $RamSize = 512,
-    [int]   $Watch   = 0,
-    [string]$Compare = '',
-    [string]$Config  = ''
+    [string]$Export   = '',
+    [string[]]$Tests,
+    [int]   $Passes   = 5,
+    [int]   $RamSize  = 512,
+    [int]   $Watch    = 0,
+    [string]$Compare  = '',
+    [string]$Config   = '',
+    [switch]$UploadDPaste,
+    [switch]$UploadGoFile
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
+# PARSING $Tests — accepte "RAM,WHEA" ou @('RAM','WHEA') ou "RAM WHEA"
+#─────────────────────────────────────────────────────────────────────────────
+if ($Tests) {
+    $Tests = $Tests |
+        ForEach-Object { $_ -split '[,\s]+' } |
+        ForEach-Object { $_.Trim() } |
+        Where-Object   { $_ -ne '' }
+}
+
+#─────────────────────────────────────────────────────────────────────────────
 # ADMIN CHECK — demande confirmation avant elevation
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 
@@ -89,19 +86,75 @@ if (-not $IsAdmin) {
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
+# RESOLUTION DES TESTS
+#─────────────────────────────────────────────────────────────────────────────
+$allTests   = @('RAM', 'Latence', 'WHEA', 'Temp', 'Disque', 'GPU', 'Uptime')
+$watchTests = @('Latence', 'Temp', 'Disque', 'Uptime')
+
+function Resolve-Tests {
+    param([string[]]$raw)
+
+    if (-not $raw) { return @('RAM', 'Uptime') }
+
+    if ($raw | Where-Object { $_ -match '^(Tout|All)$' }) {
+        return @($allTests)
+    }
+
+    $resolved = @()
+    foreach ($item in $raw) {
+        foreach ($t in ($item -split '[,\s]+')) {
+            $t = $t.Trim()
+            if (-not $t) { continue }
+
+            $match = $allTests | Where-Object { $_ -ieq $t }
+            if ($match) {
+                $resolved += $match
+            }
+            elseif (-not $Silent) {
+                Write-Warning "Test inconnu ignore : '$t' (valeurs valides : $($allTests -join ', '))"
+            }
+        }
+    }
+
+    if ($resolved.Count -eq 0) { return @('RAM', 'Uptime') }
+    return $resolved | Select-Object -Unique
+}
+
+$script:testsToRun = Resolve-Tests $Tests
+
+function Set-ShouldRun { param([string]$name); return $script:testsToRun -contains $name }
+
+#─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION — defaults + chargement config.json si present
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 $cfg = @{
-    LatMoyMax      = 20
-    LatP99Max      = 100
-    TempCPUMax     = 85
-    TempGPUMax     = 90
-    DiskPctMax     = 85
-    DiskWriteMin   = 100
-    RamPctWarn     = 80
-    RamPctFail     = 90
-    UptimeDaysWarn = 30
+    # Seuils RAM
+    RamPctWarn      = 80
+    RamPctFail      = 90
+    RamSizeAutoMB   = 0
+    RamPasses       = 0
+    RamMaxThreads   = 8
+    RamOsReserveMB  = 256
+    RamPerThreadMin = 64
+    # Seuils CPU scheduling
+    LatMoyMax       = 20
+    LatP99Max       = 100
+    LatJitterWarn   = 3.0
+    LatJitterFail   = 8.0
+    LatSamples      = 500
+    # Seuils temperature
+    TempCPUMax      = 85
+    TempGPUMax      = 90
+    # Seuils disque
+    DiskPctMax      = 85
+    DiskWriteMin    = 100
+    DiskReadMin     = 100
+    DiskTestSizeMB  = 1024
+    # Uptime
+    UptimeDaysWarn  = 30
+    # OHM
+    OhmTimeoutSec   = 25
 }
 
 $defaultConfig = Join-Path $env:APPDATA 'occt81\occt81.config.json'
@@ -112,93 +165,144 @@ $configPath    = if ($Config -and (Test-Path $Config)) { $Config }
 if ($configPath) {
     try {
         $loaded = Get-Content $configPath -Raw | ConvertFrom-Json
-        foreach ($k in $cfg.Keys) {
-            if ($null -ne $loaded.$k) { $cfg[$k] = [int]$loaded.$k }
+        # Copier les cles dans un tableau fixe AVANT d iterер :
+        # foreach ($k in $cfg.Keys) modifie la collection pendant l enumeration
+        # => "Collection was modified; enumeration operation may not execute."
+        $cfgKeys = @($cfg.Keys)
+        foreach ($k in $cfgKeys) {
+            if ($null -ne $loaded.$k) {
+                # Conserver le type : float pour les ratios, int pour le reste
+                $cfg[$k] = if ($cfg[$k] -is [double] -or $loaded.$k -match '\.')
+                               { [double]$loaded.$k }
+                           else
+                               { [int]$loaded.$k }
+            }
         }
-    } catch { Write-Warning "Config invalide : $configPath" }
+    }
+    catch {
+        if (-not $Silent -and (Test-Path $configPath)) {
+            Write-Warning "Config invalide (JSON corrompu ?) : $configPath — $($_.Exception.Message)"
+        }
+    }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+# Generation du fichier config exemple si absent
+if (-not (Test-Path $defaultConfig) -and -not $Silent) {
+    try {
+        $cfgDir = Split-Path $defaultConfig
+        if (-not (Test-Path $cfgDir)) { New-Item -ItemType Directory $cfgDir -Force | Out-Null }
+        $cfgTemplate = [ordered]@{
+            '_aide'          = "Toutes les valeurs sont optionnelles. Supprimer une cle = valeur par defaut."
+            RamSizeAutoMB    = 0
+            '_RamSizeAutoMB' = "0=auto (25% RAM physique, min 512, max 4096). >0=fixe en Mo. Priorite sur -RamSize CLI."
+            RamPasses        = 0
+            '_RamPasses'     = "0=utilise -Passes CLI. >0 override."
+            RamMaxThreads    = $cfg.RamMaxThreads
+            '_RamMaxThreads' = "Nb max threads RAM (1-32). Defaut: 8."
+            RamOsReserveMB   = $cfg.RamOsReserveMB
+            '_RamOsReserveMB'= "Mo reserves pour l OS (defaut: 256)."
+            RamPerThreadMin  = $cfg.RamPerThreadMin
+            RamPctWarn       = $cfg.RamPctWarn
+            RamPctFail       = $cfg.RamPctFail
+            LatMoyMax        = $cfg.LatMoyMax
+            '_LatMoyMax'     = "ms moyenne scheduling -> WARN si depasse."
+            LatP99Max        = $cfg.LatP99Max
+            LatJitterWarn    = $cfg.LatJitterWarn
+            LatJitterFail    = $cfg.LatJitterFail
+            LatSamples       = $cfg.LatSamples
+            '_LatSamples'    = "Nb echantillons scheduling (defaut: 500)."
+            TempCPUMax       = $cfg.TempCPUMax
+            TempGPUMax       = $cfg.TempGPUMax
+            DiskPctMax       = $cfg.DiskPctMax
+            DiskWriteMin     = $cfg.DiskWriteMin
+            DiskReadMin      = $cfg.DiskReadMin
+            DiskTestSizeMB   = $cfg.DiskTestSizeMB
+            '_DiskTestSizeMB'= "Mo utilises par le test sequentiel dd (defaut: 1024)."
+            UptimeDaysWarn   = $cfg.UptimeDaysWarn
+            OhmTimeoutSec    = $cfg.OhmTimeoutSec
+        }
+        $cfgTemplate | ConvertTo-Json | Set-Content $defaultConfig -Encoding UTF8
+        Write-Host "    Config template cree : $defaultConfig" -ForegroundColor DarkGray
+    } catch { <# non bloquant #> }
+}
+
+#─────────────────────────────────────────────────────────────────────────────
 # AIDE
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 if ($Help) {
     Write-Host @'
-
-occt81 v3.0 — Diagnostic systeme universel Windows
-=======================================================
+occt81 v4.2 CLI — Diagnostic systeme universel Windows
 USAGE    .\occt81.ps1 [options]
-
 OPTIONS
-  -GUI                Interface graphique WPF (sparkline, watch, compare)
-  -Tests <liste>      RAM, Latence, WHEA, Temp, Disque, GPU, Uptime, Tout
-  -Export <fichier>   Rapport .txt / .csv / .html
-  -Silent             Pas de sortie console
-  -Passes <n>         Passes RAM (defaut : 5)
-  -RamSize <Mo>       Buffer RAM (defaut : 512 Mo)
-  -Watch <n>          Mode surveillance toutes les n secondes
-  -Compare <json>     Compare avec un run precedent
-  -Config <json>      Fichier de seuils personnalises
-  -Help               Cette aide  |  -Man Manuel complet
-
+  -Tests       RAM, Latence (scheduling CPU), WHEA, Temp, Disque, GPU, Uptime, Tout
+  -Export      Rapport .txt / .csv / .html / .json
+  -Silent      Pas de sortie console
+  -Passes      Passes RAM (defaut : 5)
+  -RamSize     Buffer RAM (defaut : 512 Mo)
+  -Watch       Mode surveillance toutes les N secondes
+  -Compare     Compare avec un run precedent (JSON)
+  -Config      Fichier de seuils personnalises
+  -UploadDPaste   Upload du rapport sur DPaste
+  -UploadGoFile   Upload du rapport sur GoFile
+  -Help        Cette aide
+  -Man         Manuel complet
 EXEMPLES
   .\occt81.ps1
-  .\occt81.ps1 -GUI
   .\occt81.ps1 -Tests "RAM,WHEA" -Export rapport.html
   .\occt81.ps1 -Watch 60
+  .\occt81.ps1 -Tests Tout -Export rapport.json -UploadDPaste
   .\occt81.ps1 -Compare "$env:APPDATA\occt81\history\2024-01-01.json"
-
 '@ -ForegroundColor Cyan
     exit 0
 }
 if ($Man) { Get-Help $MyInvocation.MyCommand.Path -Full; exit 0 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 # UTILITAIRES CLI
-# ─────────────────────────────────────────────────────────────────────────────
-function Write-Header([string]$text) {
+#─────────────────────────────────────────────────────────────────────────────
+function Write-Header {
+    param([string]$text)
     if ($Silent) { return }
     $bar = '=' * 58
     Write-Host "`n$bar" -ForegroundColor DarkCyan
-    Write-Host "  $text" -ForegroundColor Cyan
-    Write-Host "$bar" -ForegroundColor DarkCyan
+    Write-Host "  $text"  -ForegroundColor Cyan
+    Write-Host "$bar"     -ForegroundColor DarkCyan
 }
 
-function Write-Section([string]$text) {
+function Write-Section {
+    param([string]$text)
     if ($Silent) { return }
     Write-Host "`n -- $text" -ForegroundColor Yellow
 }
 
-function Write-Info([string]$text, [string]$color = 'Gray') {
+function Write-Info {
+    param([string]$text, [string]$color = 'Gray')
     if ($Silent) { return }
     Write-Host "    $text" -ForegroundColor $color
 }
 
-function Get-StatusColor([string]$status) {
+function Get-StatusColor {
+    param([string]$status)
     switch ($status) {
-        'OK'   { return 'Green' }
-        'WARN' { return 'Yellow' }
-        'FAIL' { return 'Red' }
-        default{ return 'DarkGray' }
+        'OK'    { return 'Green' }
+        'WARN'  { return 'Yellow' }
+        'FAIL'  { return 'Red' }
+        default { return 'DarkGray' }
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TESTS A EXECUTER
-# ─────────────────────────────────────────────────────────────────────────────
-$allTests   = @('RAM','Latence','WHEA','Temp','Disque','GPU','Uptime')
-$watchTests = @('Latence','Temp','Disque','Uptime')
-$testsToRun = if ($Tests -eq 'Tout') { $allTests } else {
-    $Tests -split ',' | ForEach-Object { $_.Trim() }
-}
-
-function Set-Should-Run([string]$name) { $testsToRun -contains $name }
-
-# ─────────────────────────────────────────────────────────────────────────────
-# COLLECTE RESULTATS (liste partagee CLI + GUI)
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
+# COLLECTE RESULTATS
+#─────────────────────────────────────────────────────────────────────────────
 $results = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-function Add-Result([string]$test,[string]$status,[string]$valeur,[string]$detail='') {
+function Add-Result {
+    param(
+        [string]$test,
+        [string]$status,
+        [string]$valeur,
+        [string]$detail = ''
+    )
     $r = [PSCustomObject]@{
         Test   = $test
         Status = $status
@@ -210,97 +314,854 @@ function Add-Result([string]$test,[string]$status,[string]$valeur,[string]$detai
     return $r
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 1 — RAM avec patterns reels
-# ─────────────────────────────────────────────────────────────────────────────
-function Invoke-RamTest {
-    Write-Section "RAM — patterns memoire (${RamSize} Mo, $Passes passes)"
+#─────────────────────────────────────────────────────────────────────────────
+# INTEROP + MOTEUR RAM — tout en C# natif
+# - VirtualLock / VirtualUnlock (pin pages physiques)
+# - SetProcessWorkingSetSize (elargit le quota de lock du process)
+# - SeLockMemoryPrivilege
+# - Toutes les boucles fill/check/walking en unsafe C# pour la vitesse
+# - Parallel.For pour multi-thread natif (pas de runspaces PS)
+# - Progress reporting via volatile int partage
+#─────────────────────────────────────────────────────────────────────────────
+$RamEngineCode = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Diagnostics;
 
-    $size      = [int]($RamSize * 1MB)
-    $ramErrors = 0
-    $patterns  = @([byte]0x00,[byte]0xFF,[byte]0xAA,[byte]0x55,[byte]0xCC,[byte]0x33)
+public static class RamEngine {
 
-    for ($pass = 1; $pass -le $Passes; $pass++) {
-        $pat = $patterns[($pass - 1) % $patterns.Count]
-        Write-Info "Pass $pass/$Passes — pattern 0x$('{0:X2}' -f $pat)" -color 'DarkGray'
-        [System.GC]::Collect()
-        [System.GC]::WaitForPendingFinalizers()
+    // ── P/Invoke ──────────────────────────────────────────────────────────────
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool VirtualLock(IntPtr addr, UIntPtr size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool VirtualUnlock(IntPtr addr, UIntPtr size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetProcessWorkingSetSize(IntPtr hProcess, UIntPtr min, UIntPtr max);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool OpenProcessToken(IntPtr hProc, uint access, out IntPtr hToken);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool LookupPrivilegeValue(string sys, string name, out LUID luid);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool AdjustTokenPrivileges(IntPtr hToken, bool disable,
+        ref TOKEN_PRIVILEGES tp, uint len, IntPtr prev, IntPtr retLen);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern int GetLastError();
 
-        $buf = [byte[]]::new($size)
-        for ($i = 0; $i -lt $size; $i++) { $buf[$i] = $pat }
+    [StructLayout(LayoutKind.Sequential)] struct LUID { public uint Low; public int High; }
+    [StructLayout(LayoutKind.Sequential)] struct LUID_ATTR { public LUID Luid; public uint Attr; }
+    [StructLayout(LayoutKind.Sequential)] struct TOKEN_PRIVILEGES { public uint Count; public LUID_ATTR P; }
 
-        $ok = $true
-        for ($i = 0; $i -lt $size; $i++) {
-            if ($buf[$i] -ne $pat) { $ok = $false; break }
-        }
-        if (-not $ok) { $ramErrors++ }
+    const uint TOK_ADJUST = 0x0020, TOK_QUERY = 0x0008, SE_ENABLE = 2;
 
-        # Checkerboard sur passes paires
-        if ($pass % 2 -eq 0) {
-            $alt = if ($pat -eq [byte]0xAA) { [byte]0x55 } else { [byte]0xAA }
-            for ($i = 0; $i -lt $size; $i += 2) { $buf[$i] = $alt }
-            $errChk = $false
-            for ($i = 0; $i -lt $size; $i++) {
-                $exp = if ($i % 2 -eq 0) { $alt } else { $pat }
-                if ($buf[$i] -ne $exp) { $errChk = $true; break }
+    // ── Privilege + Working Set ────────────────────────────────────────────────
+    public static bool TryEnableLockMemory() {
+        IntPtr tok;
+        if (!OpenProcessToken(GetCurrentProcess(), TOK_ADJUST | TOK_QUERY, out tok)) return false;
+        try {
+            LUID luid;
+            if (!LookupPrivilegeValue(null, "SeLockMemoryPrivilege", out luid)) return false;
+            var tp = new TOKEN_PRIVILEGES { Count=1, P=new LUID_ATTR{Luid=luid, Attr=SE_ENABLE} };
+            AdjustTokenPrivileges(tok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+            return GetLastError() == 0;
+        } finally { CloseHandle(tok); }
+    }
+
+    // Elargit le Working Set du process pour permettre VirtualLock sur de gros buffers
+    // min/max en octets
+    public static bool ExpandWorkingSet(long minBytes, long maxBytes) {
+        return SetProcessWorkingSetSize(GetCurrentProcess(),
+            (UIntPtr)(ulong)minBytes, (UIntPtr)(ulong)maxBytes);
+    }
+
+    // ── Structures de resultat ────────────────────────────────────────────────
+    public class ThreadResult {
+        public int  ThreadId;
+        public int  Errors;
+        public bool Locked;
+        public long LockedBytes;
+        public long TestedBytes;
+        public double ElapsedSec;
+    }
+
+    public class RunResult {
+        public ThreadResult[] Threads;
+        public int  TotalErrors;
+        public long TotalLockedMB;
+        public long TotalTestedMB;
+        public int  BW_MBs;
+        public string LockStatus;
+    }
+
+    // ── Progress partagé (volatile) ───────────────────────────────────────────
+    static volatile int _passesCompleted = 0;
+    static volatile int _totalPassesExpected = 0;
+    public static int  PassesCompleted   { get { return _passesCompleted; } }
+    public static int  TotalPassesExpected { get { return _totalPassesExpected; } }
+    public static void ResetProgress(int total) { _passesCompleted = 0; _totalPassesExpected = total; }
+
+    // ── Moteur de test principal ──────────────────────────────────────────────
+    // patterns : tableau de byte patterns a tester
+    // sizePerThreadBytes : taille du buffer par thread
+    // passes : nombre de passes solid
+    // numThreads : parallelisme
+    // lockPriv : true si SeLockMemoryPrivilege disponible
+    public static RunResult RunTest(
+        int    numThreads,
+        long   sizePerThreadBytes,
+        int    passes,
+        bool   lockPriv)
+    {
+        byte[] solidPatterns = new byte[] { 0x00, 0xFF, 0xAA, 0x55, 0xCC, 0x33 };
+        // phases par thread : passes solid + floor(passes/2) checkerboard + 16 walking
+        int walkPhases = 16; // 8 bits x 2 (1s + 0s)
+        int cbPhases   = passes / 2;
+        int totalPhases = passes + cbPhases + walkPhases;
+        ResetProgress(numThreads * totalPhases);
+
+        var results = new ThreadResult[numThreads];
+        var sw = Stopwatch.StartNew();
+
+        Parallel.For(0, numThreads, new ParallelOptions { MaxDegreeOfParallelism = numThreads }, t => {
+            var res = new ThreadResult { ThreadId = t };
+            results[t] = res;
+
+            long sz = sizePerThreadBytes;
+            byte[] buf = new byte[sz];
+
+            // Pin GC + VirtualLock
+            var handle = GCHandle.Alloc(buf, GCHandleType.Pinned);
+            bool locked = false;
+            try {
+                if (lockPriv) {
+                    IntPtr addr = handle.AddrOfPinnedObject();
+                    locked = VirtualLock(addr, (UIntPtr)(ulong)sz);
+                    res.Locked = locked;
+                    res.LockedBytes = locked ? sz : 0;
+                }
+
+                long testedBytes = 0;
+
+                // ── Solid patterns ────────────────────────────────────────────
+                for (int pass = 0; pass < passes; pass++) {
+                    byte pat = solidPatterns[pass % solidPatterns.Length];
+
+                    // Fill
+                    unsafe {
+                        fixed (byte* p = buf) {
+                            // Remplissage 8 octets a la fois (ulong)
+                            ulong val64 = (ulong)pat * 0x0101010101010101UL;
+                            long  words = sz / 8;
+                            ulong* pw = (ulong*)p;
+                            for (long i = 0; i < words; i++) pw[i] = val64;
+                            for (long i = words*8; i < sz; i++) p[i] = pat;
+                        }
+                    }
+                    testedBytes += sz;
+
+                    // Verify
+                    bool ok = true;
+                    unsafe {
+                        fixed (byte* p = buf) {
+                            ulong val64 = (ulong)pat * 0x0101010101010101UL;
+                            long  words = sz / 8;
+                            ulong* pw = (ulong*)p;
+                            for (long i = 0; i < words; i++) {
+                                if (pw[i] != val64) { ok = false; break; }
+                            }
+                            if (ok) for (long i = words*8; i < sz; i++) {
+                                if (p[i] != pat) { ok = false; break; }
+                            }
+                        }
+                    }
+                    testedBytes += sz;
+                    if (!ok) Interlocked.Increment(ref res.Errors);
+                    Interlocked.Increment(ref _passesCompleted);
+
+                    // ── Checkerboard (passes paires) ──────────────────────────
+                    if (pass % 2 == 1) {
+                        byte alt = (pat == 0xAA) ? (byte)0x55 : (byte)0xAA;
+                        unsafe {
+                            fixed (byte* p = buf) {
+                                // Remplissage checkerboard 2 octets a la fois
+                                ushort cb = (ushort)((alt << 8) | pat);
+                                long pairs = sz / 2;
+                                ushort* pw = (ushort*)p;
+                                for (long i = 0; i < pairs; i++) pw[i] = cb;
+                                if (sz % 2 != 0) p[sz-1] = alt;
+                            }
+                        }
+                        bool okCb = true;
+                        unsafe {
+                            fixed (byte* p = buf) {
+                                for (long i = 0; i < sz-1; i += 2) {
+                                    if (p[i] != alt || p[i+1] != pat) { okCb=false; break; }
+                                }
+                            }
+                        }
+                        testedBytes += sz;
+                        if (!okCb) Interlocked.Increment(ref res.Errors);
+                        Interlocked.Increment(ref _passesCompleted);
+                    }
+                }
+
+                // ── Walking 1s / 0s ───────────────────────────────────────────
+                for (int bit = 0; bit < 8; bit++) {
+                    byte p1 = (byte)(1 << bit);
+                    byte p0 = (byte)(~p1);
+
+                    foreach (byte wp in new byte[]{p1, p0}) {
+                        unsafe {
+                            fixed (byte* p = buf) {
+                                ulong val64 = (ulong)wp * 0x0101010101010101UL;
+                                long words = sz / 8; ulong* pw = (ulong*)p;
+                                for (long i = 0; i < words; i++) pw[i] = val64;
+                                for (long i = words*8; i < sz; i++) p[i] = wp;
+                            }
+                        }
+                        bool ok = true;
+                        unsafe {
+                            fixed (byte* p = buf) {
+                                ulong val64 = (ulong)wp * 0x0101010101010101UL;
+                                long words = sz/8; ulong* pw = (ulong*)p;
+                                for (long i = 0; i < words; i++) {
+                                    if (pw[i] != val64) { ok=false; break; }
+                                }
+                                if (ok) for (long i = words*8; i < sz; i++) {
+                                    if (p[i] != wp) { ok=false; break; }
+                                }
+                            }
+                        }
+                        testedBytes += sz * 2;
+                        if (!ok) Interlocked.Increment(ref res.Errors);
+                        Interlocked.Increment(ref _passesCompleted);
+                    }
+                }
+
+                res.TestedBytes = testedBytes;
+
+            } finally {
+                if (locked) {
+                    try { VirtualUnlock(handle.AddrOfPinnedObject(), (UIntPtr)(ulong)sz); } catch {}
+                }
+                if (handle.IsAllocated) handle.Free();
+                buf = null;
+                GC.Collect();
             }
-            if ($errChk) { $ramErrors++ }
+        });
+
+        sw.Stop();
+
+        var run = new RunResult();
+        run.Threads = results;
+        foreach (var r in results) {
+            if (r == null) continue;
+            run.TotalErrors   += r.Errors;
+            run.TotalLockedMB += r.LockedBytes / (1024*1024);
+            run.TotalTestedMB += r.TestedBytes / (1024*1024);
+        }
+        double sec = sw.Elapsed.TotalSeconds;
+        run.BW_MBs = sec > 0 ? (int)(run.TotalTestedMB / sec) : 0;
+        bool anyLocked = run.TotalLockedMB > 0;
+        run.LockStatus = anyLocked
+            ? string.Format("VirtualLock OK — {0} Mo epingles en RAM physique", run.TotalLockedMB)
+            : (lockPriv ? "VirtualLock: privilege OK mais refuse par Windows (Hyper-V? quota?)"
+                        : "VirtualLock: non disponible (pas admin ou GPO)");
+        return run;
+    }
+}
+'@
+
+# Version safe (sans unsafe/fixed/pointeurs) — fallback si /unsafe indisponible
+$RamEngineCodeSafe = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Diagnostics;
+
+public static class RamEngine {
+
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool VirtualLock(IntPtr addr, UIntPtr size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool VirtualUnlock(IntPtr addr, UIntPtr size);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetProcessWorkingSetSize(IntPtr hProcess, UIntPtr min, UIntPtr max);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool OpenProcessToken(IntPtr hProc, uint access, out IntPtr hToken);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool LookupPrivilegeValue(string sys, string name, out LUID luid);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool AdjustTokenPrivileges(IntPtr hToken, bool disable,
+        ref TOKEN_PRIVILEGES tp, uint len, IntPtr prev, IntPtr retLen);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern int GetLastError();
+
+    [StructLayout(LayoutKind.Sequential)] struct LUID { public uint Low; public int High; }
+    [StructLayout(LayoutKind.Sequential)] struct LUID_ATTR { public LUID Luid; public uint Attr; }
+    [StructLayout(LayoutKind.Sequential)] struct TOKEN_PRIVILEGES { public uint Count; public LUID_ATTR P; }
+
+    const uint TOK_ADJUST = 0x0020, TOK_QUERY = 0x0008, SE_ENABLE = 2;
+
+    public static bool TryEnableLockMemory() {
+        IntPtr tok;
+        if (!OpenProcessToken(GetCurrentProcess(), TOK_ADJUST | TOK_QUERY, out tok)) return false;
+        try {
+            LUID luid;
+            if (!LookupPrivilegeValue(null, "SeLockMemoryPrivilege", out luid)) return false;
+            var tp = new TOKEN_PRIVILEGES { Count=1, P=new LUID_ATTR{Luid=luid, Attr=SE_ENABLE} };
+            AdjustTokenPrivileges(tok, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+            return GetLastError() == 0;
+        } finally { CloseHandle(tok); }
+    }
+
+    public static bool ExpandWorkingSet(long minBytes, long maxBytes) {
+        return SetProcessWorkingSetSize(GetCurrentProcess(),
+            (UIntPtr)(ulong)minBytes, (UIntPtr)(ulong)maxBytes);
+    }
+
+    public class ThreadResult {
+        public int    ThreadId;
+        public int    Errors;
+        public bool   Locked;
+        public long   LockedBytes;
+        public long   TestedBytes;
+        public double ElapsedSec;
+    }
+
+    public class RunResult {
+        public ThreadResult[] Threads;
+        public int    TotalErrors;
+        public long   TotalLockedMB;
+        public long   TotalTestedMB;
+        public int    BW_MBs;
+        public string LockStatus;
+    }
+
+    static volatile int _passesCompleted = 0;
+    static volatile int _totalPassesExpected = 0;
+    public static int  PassesCompleted      { get { return _passesCompleted; } }
+    public static int  TotalPassesExpected  { get { return _totalPassesExpected; } }
+    public static void ResetProgress(int total) { _passesCompleted = 0; _totalPassesExpected = total; }
+
+    // Remplissage safe via Buffer.BlockCopy (pas de pointeurs)
+    static void FillSolid(byte[] buf, byte pat) {
+        if (buf.Length == 0) return;
+        buf[0] = pat;
+        int filled = 1;
+        while (filled < buf.Length) {
+            int copy = Math.Min(filled, buf.Length - filled);
+            Buffer.BlockCopy(buf, 0, buf, filled, copy);
+            filled += copy;
         }
     }
 
-    $st = if ($ramErrors -eq 0) { 'OK' } else { 'FAIL' }
-    $v  = if ($ramErrors -eq 0) { '0 erreur' } else { "$ramErrors erreur(s)" }
-    $d  = "Patterns 0x00/FF/AA/55/CC/33 + checkerboard | ${RamSize} Mo x $Passes passes | NOTE: ne remplace pas MemTest86"
+    static bool VerifySolid(byte[] buf, byte pat) {
+        for (long i = 0; i < buf.Length; i++)
+            if (buf[i] != pat) return false;
+        return true;
+    }
+
+    static void FillCheckerboard(byte[] buf, byte a, byte b) {
+        for (long i = 0; i < buf.Length - 1; i += 2) { buf[i] = a; buf[i+1] = b; }
+        if (buf.Length % 2 != 0) buf[buf.Length-1] = a;
+    }
+
+    static bool VerifyCheckerboard(byte[] buf, byte a, byte b) {
+        for (long i = 0; i < buf.Length - 1; i += 2)
+            if (buf[i] != a || buf[i+1] != b) return false;
+        return true;
+    }
+
+    public static RunResult RunTest(int numThreads, long sizePerThreadBytes, int passes, bool lockPriv) {
+        byte[] solidPatterns = new byte[] { 0x00, 0xFF, 0xAA, 0x55, 0xCC, 0x33 };
+        int walkPhases  = 16;
+        int cbPhases    = passes / 2;
+        int totalPhases = passes + cbPhases + walkPhases;
+        ResetProgress(numThreads * totalPhases);
+
+        var results = new ThreadResult[numThreads];
+        var sw = Stopwatch.StartNew();
+
+        Parallel.For(0, numThreads, new ParallelOptions { MaxDegreeOfParallelism = numThreads }, t => {
+            var res = new ThreadResult { ThreadId = t };
+            results[t] = res;
+
+            long sz  = sizePerThreadBytes;
+            byte[] buf = new byte[sz];
+
+            var handle = GCHandle.Alloc(buf, GCHandleType.Pinned);
+            bool locked = false;
+            try {
+                if (lockPriv) {
+                    IntPtr addr = handle.AddrOfPinnedObject();
+                    locked = VirtualLock(addr, (UIntPtr)(ulong)sz);
+                    res.Locked      = locked;
+                    res.LockedBytes = locked ? sz : 0;
+                }
+
+                long testedBytes = 0;
+
+                // Solid patterns
+                for (int pass = 0; pass < passes; pass++) {
+                    byte pat = solidPatterns[pass % solidPatterns.Length];
+                    FillSolid(buf, pat);   testedBytes += sz;
+                    if (!VerifySolid(buf, pat)) Interlocked.Increment(ref res.Errors);
+                    testedBytes += sz;
+                    Interlocked.Increment(ref _passesCompleted);
+
+                    // Checkerboard (passes paires)
+                    if (pass % 2 == 1) {
+                        byte alt = (pat == 0xAA) ? (byte)0x55 : (byte)0xAA;
+                        FillCheckerboard(buf, alt, pat);
+                        if (!VerifyCheckerboard(buf, alt, pat)) Interlocked.Increment(ref res.Errors);
+                        testedBytes += sz;
+                        Interlocked.Increment(ref _passesCompleted);
+                    }
+                }
+
+                // Walking 1s / 0s
+                for (int bit = 0; bit < 8; bit++) {
+                    byte p1 = (byte)(1 << bit);
+                    byte p0 = (byte)(~p1);
+                    foreach (byte wp in new byte[]{ p1, p0 }) {
+                        FillSolid(buf, wp);
+                        if (!VerifySolid(buf, wp)) Interlocked.Increment(ref res.Errors);
+                        testedBytes += sz * 2;
+                        Interlocked.Increment(ref _passesCompleted);
+                    }
+                }
+
+                res.TestedBytes = testedBytes;
+
+            } finally {
+                if (locked) {
+                    try { VirtualUnlock(handle.AddrOfPinnedObject(), (UIntPtr)(ulong)sz); } catch {}
+                }
+                if (handle.IsAllocated) handle.Free();
+                buf = null;
+                GC.Collect();
+            }
+        });
+
+        sw.Stop();
+
+        var run = new RunResult { Threads = results };
+        foreach (var r in results) {
+            if (r == null) continue;
+            run.TotalErrors   += r.Errors;
+            run.TotalLockedMB += r.LockedBytes / (1024*1024);
+            run.TotalTestedMB += r.TestedBytes / (1024*1024);
+        }
+        double sec = sw.Elapsed.TotalSeconds;
+        run.BW_MBs = sec > 0 ? (int)(run.TotalTestedMB / sec) : 0;
+        bool anyLocked = run.TotalLockedMB > 0;
+        run.LockStatus = anyLocked
+            ? string.Format("VirtualLock OK — {0} Mo epingles en RAM physique", run.TotalLockedMB)
+            : (lockPriv ? "VirtualLock: privilege OK mais refuse par Windows (Hyper-V? quota?)"
+                        : "VirtualLock: non disponible (pas admin ou GPO)");
+        return run;
+    }
+}
+'@
+
+#─────────────────────────────────────────────────────────────────────────────
+# COMPILATION RAMENGINE — 3 tentatives par ordre de preference
+#  1. CSharpCodeProvider direct avec /unsafe /optimize+ (plus portable)
+#  2. Add-Type -CompilerParameters (PS 5.1 standard, peut manquer sur certains hosts)
+#  3. Fallback code safe (pas de pointeurs, Buffer.BlockCopy)
+#─────────────────────────────────────────────────────────────────────────────
+$script:RamEngineCompileError = $null
+$script:RamEngineSafeMode     = $false
+
+if (-not ([System.Management.Automation.PSTypeName]'RamEngine').Type) {
+
+    # Tentative 1 : CSharpCodeProvider en memoire — charge l'assembly directement
+    $compiled = $false
+    try {
+        $provider = New-Object Microsoft.CSharp.CSharpCodeProvider
+        $cp = New-Object System.CodeDom.Compiler.CompilerParameters
+        $cp.GenerateInMemory = $true
+        $cp.CompilerOptions  = '/unsafe /optimize+'
+        $results_csc = $provider.CompileAssemblyFromSource($cp, $RamEngineCode)
+        if ($results_csc.Errors.HasErrors) {
+            $msgs = @($results_csc.Errors | ForEach-Object { $_.ToString() })
+            throw "Erreurs CSC : $($msgs -join ' ; ')"
+        }
+        # L'assembly est deja en memoire — verifier le type et forcer chargement dans le domaine PS
+        $asm = $results_csc.CompiledAssembly
+        if (-not $asm.GetType('RamEngine')) { throw "Type RamEngine introuvable dans l'assembly compile" }
+        $null = [System.AppDomain]::CurrentDomain.Load($asm.GetName())
+        $compiled = $true
+    } catch {
+        $errTry1 = $_.Exception.Message
+    }
+
+    # Tentative 2 : compilation vers DLL temporaire sur disque, puis Add-Type -Path
+    # (contourne les restrictions de certains hosts PS sur -CompilerParameters)
+    if (-not $compiled -and -not ([System.Management.Automation.PSTypeName]'RamEngine').Type) {
+        $tmpCs  = $null
+        $tmpDll = $null
+        try {
+            $tmpCs  = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "RamEngine_$([System.Guid]::NewGuid().ToString('N')).cs")
+            $tmpDll = $tmpCs -replace '\.cs$','.dll'
+            [System.IO.File]::WriteAllText($tmpCs, $RamEngineCode, [System.Text.Encoding]::UTF8)
+            $provider2 = New-Object Microsoft.CSharp.CSharpCodeProvider
+            $cp2 = New-Object System.CodeDom.Compiler.CompilerParameters
+            $cp2.GenerateInMemory = $false
+            $cp2.OutputAssembly   = $tmpDll
+            $cp2.CompilerOptions  = '/unsafe /optimize+'
+            $r2 = $provider2.CompileAssemblyFromFile($cp2, $tmpCs)
+            if ($r2.Errors.HasErrors) {
+                $msgs = @($r2.Errors | ForEach-Object { $_.ToString() })
+                throw "Erreurs CSC fichier : $($msgs -join ' ; ')"
+            }
+            Add-Type -Path $tmpDll -ErrorAction Stop
+            $compiled = $true
+        } catch {
+            $errTry2 = $_.Exception.Message
+        } finally {
+            if ($tmpCs  -and (Test-Path $tmpCs))  { Remove-Item $tmpCs  -Force -ErrorAction SilentlyContinue }
+            # Ne pas supprimer $tmpDll : Add-Type en a besoin en memoire tant que la session tourne
+        }
+    }
+
+    # Tentative 3 : code safe (Buffer.BlockCopy, pas de pointeurs)
+    if (-not $compiled -and -not ([System.Management.Automation.PSTypeName]'RamEngine').Type) {
+        try {
+            Add-Type -TypeDefinition $RamEngineCodeSafe -Language CSharp -ErrorAction Stop
+            $compiled = $true
+            $script:RamEngineSafeMode = $true
+            if (-not $Silent) {
+                Write-Warning "RamEngine compile en mode safe (pas de /unsafe) — performances legerement reduites."
+            }
+        } catch {
+            $errTry3 = $_.Exception.Message
+            $script:RamEngineCompileError = @(
+                "Tentative 1 (CSharpCodeProvider /unsafe) : $errTry1",
+                "Tentative 2 (Add-Type /unsafe)           : $errTry2",
+                "Tentative 3 (code safe)                  : $errTry3"
+            ) -join " | "
+            if (-not $Silent) {
+                Write-Warning "RamEngine : echec total compilation.`n  $($script:RamEngineCompileError -replace ' \| ', "`n  ")"
+            }
+        }
+    }
+}
+
+#─────────────────────────────────────────────────────────────────────────────
+# TEST 1 — RAM
+#─────────────────────────────────────────────────────────────────────────────
+function Invoke-RamTest {
+    # Calcul RamSizeFinal / PassesFinal : priorite config JSON > CLI > auto (25% RAM physique)
+    $osQ          = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $freePhysQMB  = if ($osQ) { [Math]::Floor($osQ.FreePhysicalMemory / 1KB) } else { $RamSize }
+    $totalPhysQMB = if ($osQ) { [Math]::Floor($osQ.TotalVisibleMemorySize / 1KB) } else { 2048 }
+    if ($cfg.RamSizeAutoMB -gt 0) {
+        $RamSizeFinal = $cfg.RamSizeAutoMB
+    } elseif ($PSBoundParameters.ContainsKey('RamSize')) {
+        $RamSizeFinal = $RamSize
+    } else {
+        $RamSizeFinal = [Math]::Max(512, [Math]::Min(4096, [int]($totalPhysQMB * 0.25)))
+    }
+    $script:RamSizeFinal = $RamSizeFinal
+    $PassesFinal = if ($cfg.RamPasses -gt 0) { $cfg.RamPasses } else { $Passes }
+
+    $modeHeader = if ($script:RamEngineSafeMode) { 'safe/Buffer.BlockCopy' } else { 'unsafe/natif' }
+    Write-Section "RAM — VirtualLock + C# $modeHeader + patterns complets ($RamSizeFinal Mo req., $PassesFinal passes)"
+
+    if (-not ([System.Management.Automation.PSTypeName]'RamEngine').Type) {
+        $cause = if ($script:RamEngineCompileError) { $script:RamEngineCompileError } else { 'Add-Type RamEngine indisponible' }
+        Write-Info "! RamEngine non compile — test RAM annule" -color 'Red'
+        Write-Info "  Cause : $cause" -color 'DarkYellow'
+        Write-Info "  Solutions : lancer en admin, verifier .NET Framework 4.x, ou utiliser PowerShell 7+" -color 'DarkYellow'
+        Add-Result 'RAM' 'N/A' 'Compilation echouee' $cause | Out-Null
+        return
+    }
+
+    # ── Privilege SeLockMemoryPrivilege ───────────────────────────────────────
+    $lockPrivOk = $false
+    if ($IsAdmin) {
+        try { $lockPrivOk = [RamEngine]::TryEnableLockMemory() } catch {}
+    }
+
+    if ($lockPrivOk) {
+        Write-Info "SeLockMemoryPrivilege : OK" -color 'DarkGray'
+    } else {
+        Write-Info "SeLockMemoryPrivilege : non disponible (pas admin ou GPO bloque)" -color 'DarkYellow'
+    }
+
+       # Calcul usable ($freePhysQMB et $RamSizeFinal deja calcules en tete de fonction)
+    $freePhysMB = $freePhysQMB
+    $usableMB   = [Math]::Max($cfg.RamPerThreadMin, $freePhysMB - $cfg.RamOsReserveMB)
+
+    $cpuLogical = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue |
+                   Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
+    # Max RamMaxThreads threads (configurable)
+    $numThreads = [Math]::Max(1, [Math]::Min([int]$cpuLogical, $cfg.RamMaxThreads))
+
+    $totalTestMB  = [Math]::Min($RamSizeFinal, $usableMB)
+    $perThreadMB  = [Math]::Max($cfg.RamPerThreadMin, [Math]::Floor($totalTestMB / $numThreads))
+    $perThreadB   = [long]($perThreadMB * 1MB)
+    $testedMB     = $perThreadMB * $numThreads
+
+    Write-Info ("RAM libre : {0} Mo | Test : {1} Mo ({2} threads x {3} Mo)" `
+        -f $freePhysMB, $testedMB, $numThreads, $perThreadMB) -color 'Gray'
+
+    if ($totalTestMB -lt $RamSizeFinal) {
+        Write-Info ("  ! RAM libre ({0} Mo) < RamSize ({1} Mo) — test reduit" `
+            -f $usableMB, $RamSizeFinal) -color 'DarkYellow'
+    }
+
+    # ── Elargir le Working Set pour permettre VirtualLock ────────────────────
+    if ($lockPrivOk) {
+        $minWS = [long]($testedMB + 512) * 1MB
+        $maxWS = [long]($testedMB + [Math]::Max(512, $cfg.RamOsReserveMB * 4)) * 1MB
+        try {
+            $wsOk = [RamEngine]::ExpandWorkingSet($minWS, $maxWS)
+            if ($wsOk) {
+                Write-Info ("Working Set elargi a {0} Mo min pour VirtualLock" -f ($minWS/1MB)) -color 'DarkGray'
+            } else {
+                Write-Info "  ! ExpandWorkingSet refuse — VirtualLock peut echouer sur gros buffers" -color 'DarkYellow'
+            }
+        } catch {
+            Write-Info "  ! ExpandWorkingSet exception : $($_.Exception.Message)" -color 'DarkYellow'
+        }
+    }
+
+    # ── Lancement avec progress ───────────────────────────────────────────────
+    $modeLabel = if ($script:RamEngineSafeMode) { 'mode safe — Buffer.BlockCopy' } else { 'mode unsafe — pointeurs natifs' }
+    Write-Info "Lancement ($numThreads threads, $modeLabel)..." -color 'DarkGray'
+
+    # Lancer le test en arriere-plan PS pour pouvoir afficher la progression
+    $runJob = [System.Management.Automation.PowerShell]::Create()
+    $null   = $runJob.AddScript({
+        param($nt, $ptb, $passes, $lock)
+        return [RamEngine]::RunTest($nt, $ptb, $passes, $lock)
+    }).AddArgument($numThreads).AddArgument($perThreadB).AddArgument($PassesFinal).AddArgument($lockPrivOk)
+
+    $rsAsync = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $rsAsync.Open()
+    $runJob.Runspace = $rsAsync
+    $asyncHandle = $runJob.BeginInvoke()
+
+    # Boucle de progression dans le thread principal
+    $spinner = @('|','/','-','\')
+    $si = 0
+    while (-not $asyncHandle.IsCompleted) {
+        $done  = [RamEngine]::PassesCompleted
+        $total = [RamEngine]::TotalPassesExpected
+        $pct   = if ($total -gt 0) { [Math]::Round($done / $total * 100, 0) } else { 0 }
+        $spin  = $spinner[$si % 4]; $si++
+        if (-not $Silent) {
+            Write-Host ("`r    {0} Progression : {1}% ({2}/{3} phases)" `
+                -f $spin, $pct, $done, $total) -NoNewline -ForegroundColor DarkGray
+        }
+        Start-Sleep -Milliseconds 400
+    }
+    if (-not $Silent) { Write-Host "`r    " -NoNewline }  # efface la ligne spinner
+
+    # Collecte resultat
+    $runResult = $null
+    try {
+        $raw = $runJob.EndInvoke($asyncHandle)
+        $runResult = $raw | Select-Object -First 1
+    } catch {
+        Write-Info "! Erreur RunTest : $($_.Exception.Message)" -color 'Red'
+    } finally {
+        $runJob.Dispose()
+        $rsAsync.Close()
+    }
+
+    if (-not $runResult) {
+        Add-Result 'RAM' 'N/A' 'Erreur execution' 'RunTest a leve une exception' | Out-Null
+        return
+    }
+
+    # ── Affichage resultats ───────────────────────────────────────────────────
+    $allErrors = $runResult.TotalErrors
+    $lockInfo  = $runResult.LockStatus
+    $bw        = $runResult.BW_MBs
+    $lockedMB  = $runResult.TotalLockedMB
+
+    Write-Info ("Termine : {0} Mo testes | {1} | BW: {2} Mo/s" `
+        -f $testedMB, $lockInfo, $bw) -color 'Gray'
+
+    $st = if ($allErrors -eq 0) { 'OK' } else { 'FAIL' }
+    $v  = if ($allErrors -eq 0) { '0 erreur' } else { "$allErrors erreur(s)" }
+    $engineMode = if ($script:RamEngineSafeMode) { 'C# safe (Buffer.BlockCopy)' } else { 'C# natif+unsafe' }
+    $lockDetail = if ($lockedMB -gt 0) { "Epingles: ${lockedMB} Mo" } else { "VirtualLock: non actif" }
+    $d  = "$engineMode | ${testedMB} Mo / $numThreads threads / $PassesFinal passes | $lockDetail | BW: ${bw} Mo/s | Solid+Checkerboard+Walking1s/0s | Scan complet 64-bit"
 
     Write-Info "Resultat : $v" -color (Get-StatusColor $st)
-    Write-Info "NOTE : test de coherence memoire logiciel. Pour hardware complet -> MemTest86 hors OS." -color 'DarkYellow'
+    Write-Host ""
+    Write-Host "    ┌─ LIMITE CONNUE ────────────────────────────────────────────────────┐" -ForegroundColor DarkYellow
+    Write-Host "    │ VirtualLock epingle les pages en RAM physique (si privilege OK).    │" -ForegroundColor DarkYellow
+    Write-Host "    │ Ce test NE peut PAS couvrir : pages reservees OS/drivers/BIOS,     │" -ForegroundColor DarkYellow
+    Write-Host "    │ erreurs liees a la temperature ou la tension des modules,           │" -ForegroundColor DarkYellow
+    Write-Host "    │ ni adresser directement les rangees physiques (row hammer, etc).    │" -ForegroundColor DarkYellow
+    Write-Host "    │ Pour validation hardware complete (overclock, stabilite DIMM) :     │" -ForegroundColor DarkYellow
+    Write-Host "    │   -> MemTest86 ou TestMem5  (hors OS, acces physique direct)       │" -ForegroundColor DarkYellow
+    Write-Host "    └────────────────────────────────────────────────────────────────────┘" -ForegroundColor DarkYellow
+    Write-Host ""
+
     Add-Result 'RAM' $st $v $d | Out-Null
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 2 — LATENCE CPU (mesure temps execution PS)
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
+# TEST 2 — CHARGE CPU / SCHEDULING (mesure scheduling OS + freq effective)
+#─────────────────────────────────────────────────────────────────────────────
 function Invoke-LatenceTest {
-    Write-Section "LATENCE execution PowerShell (200 echantillons)"
+    Write-Section "SCHEDULING CPU — regularite d'execution ($($cfg.LatSamples) echantillons)"
 
+    # ── Explications pedagogiques ────────────────────────────────────────────
+    if (-not $Silent) {
+        Write-Host "    Ce test NE mesure PAS la latence hardware du CPU." -ForegroundColor DarkYellow
+        Write-Host "    Il mesure la REGULARITE avec laquelle Windows execute ce processus." -ForegroundColor DarkYellow
+        Write-Host "    Chaque echantillon = $([int]1e5) ops XOR/MUL chronometrees." -ForegroundColor DarkYellow
+        Write-Host "    Un jitter eleve = l'OS preempte souvent ce thread (DPC, IRQ, autre process)." -ForegroundColor DarkYellow
+        Write-Host ""
+    }
+
+    # ── Frequence CPU effective ───────────────────────────────────────────────
+    $freqInfo = ''
+    $freqPct  = 0
+    try {
+        $proc = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+        $maxMHz = $proc.MaxClockSpeed
+        $curMHz = $proc.CurrentClockSpeed
+        if ($maxMHz -gt 0 -and $curMHz -gt 0) {
+            $freqPct  = [Math]::Round($curMHz / $maxMHz * 100, 0)
+            $freqInfo = "Freq CPU: ${curMHz} MHz / ${maxMHz} MHz (${freqPct}%)"
+            $freqColor = if ($freqPct -ge 95) { 'Green' } elseif ($freqPct -ge 80) { 'Yellow' } else { 'Red' }
+            Write-Info $freqInfo -color $freqColor
+            if ($freqPct -lt 80) {
+                Write-Info "  ! Freq < 80% — throttling possible (temperature ? plan d alimentation ?)" -color 'DarkYellow'
+            }
+        }
+    }
+    catch { Write-Verbose "Freq CPU WMI : $($_.Exception.Message)" }
+
+    # ── Warmup JIT ────────────────────────────────────────────────────────────
+    if (-not $Silent) { Write-Host "    Warmup JIT..." -ForegroundColor DarkGray -NoNewline }
     $warmup = [System.Diagnostics.Stopwatch]::StartNew()
-    while ($warmup.ElapsedMilliseconds -lt 500) { $null = 1 + 1 }
+    while ($warmup.ElapsedMilliseconds -lt 1000) { $null = [Math]::Sqrt(12345.6789) }
     $warmup.Stop()
+    if (-not $Silent) { Write-Host " OK" -ForegroundColor DarkGray }
 
-    $samples = 200
+    # ── Mesure ────────────────────────────────────────────────────────────────
+    $samples = $cfg.LatSamples
     $lat     = [double[]]::new($samples)
     $sw      = [System.Diagnostics.Stopwatch]::new()
 
+    if (-not $Silent) { Write-Host "    Mesure en cours..." -ForegroundColor DarkGray -NoNewline }
     for ($i = 0; $i -lt $samples; $i++) {
         $sw.Restart()
-        $x = 0
-        for ($j = 0; $j -lt 50000; $j++) { $x = $x -bxor ($j * 7) }
+        $x = [long]0
+        for ($j = 0; $j -lt 100000; $j++) { $x = $x -bxor ([long]$j * 2654435761L) }
         $sw.Stop()
         $lat[$i] = $sw.Elapsed.TotalMilliseconds
+        if ($x -eq 0) { Write-Verbose "prevent-opt" }
     }
+    if (-not $Silent) { Write-Host " OK ($samples echantillons)" -ForegroundColor DarkGray }
 
+    # ── Calculs statistiques ─────────────────────────────────────────────────
     $avg    = ($lat | Measure-Object -Average).Average
     $sorted = $lat | Sort-Object
+    $p50    = $sorted[[Math]::Min([int]($samples * 0.50), $samples - 1)]
     $p95    = $sorted[[Math]::Min([int]($samples * 0.95), $samples - 1)]
     $p99    = $sorted[[Math]::Min([int]($samples * 0.99), $samples - 1)]
     $maxL   = ($lat | Measure-Object -Maximum).Maximum
-    $txt    = "Avg={0:N2}ms P95={1:N2}ms P99={2:N2}ms Max={3:N2}ms" -f $avg,$p95,$p99,$maxL
+    $minL   = ($lat | Measure-Object -Minimum).Minimum
 
-    Write-Info $txt -color 'Gray'
-    Write-Info "NOTE : mesure le temps d'execution PS, pas la latence CPU hardware." -color 'DarkYellow'
+    # Jitter = P99 / Min  (1.0 = parfait, >3 = problematique, >8 = critique)
+    $jitter = if ($minL -gt 0) { [Math]::Round($p99 / $minL, 1) } else { 0 }
 
-    $stAvg = if ($avg -lt $cfg.LatMoyMax) { 'OK' } else { 'WARN' }
-    $stP99 = if ($p99 -lt $cfg.LatP99Max) { 'OK' } else { 'WARN' }
+    # Outliers = echantillons > 2x la moyenne
+    $outliers = @($lat | Where-Object { $_ -gt ($avg * 2) }).Count
+    $outlierPct = [Math]::Round($outliers / $samples * 100, 1)
 
-    Add-Result 'Latence (moy)' $stAvg ("{0:N2} ms" -f $avg) $txt | Out-Null
-    Add-Result 'Latence (P99)' $stP99 ("{0:N2} ms" -f $p99) $txt | Out-Null
+    # ── Tableau de resultats detaille ────────────────────────────────────────
+    if (-not $Silent) {
+        Write-Host ""
+        Write-Host "    ┌─ RESULTATS SCHEDULING ────────────────────────────────────────────┐" -ForegroundColor Cyan
+        Write-Host ("    │  Min  (meilleur cas, sans interruption)  : {0,8:N2} ms              │" -f $minL) -ForegroundColor Cyan
+        Write-Host ("    │  Moy  (moyenne des {0} echantillons)    : {1,8:N2} ms              │" -f $samples, $avg) -ForegroundColor Cyan
+        Write-Host ("    │  P50  (mediane — 50% des runs)           : {0,8:N2} ms              │" -f $p50) -ForegroundColor Cyan
+        Write-Host ("    │  P95  (95% des runs terminent avant)     : {0,8:N2} ms              │" -f $p95) -ForegroundColor Cyan
+        Write-Host ("    │  P99  (99% des runs terminent avant)     : {0,8:N2} ms              │" -f $p99) -ForegroundColor Cyan
+        Write-Host ("    │  Max  (pire interruption observee)       : {0,8:N2} ms              │" -f $maxL) -ForegroundColor Cyan
+
+        # Couleur jitter selon seuils
+        $jitterColor = if ($jitter -lt $cfg.LatJitterWarn) { 'Green' }
+                       elseif ($jitter -lt $cfg.LatJitterFail) { 'Yellow' }
+                       else { 'Red' }
+        $jitterLabel = if ($jitter -lt $cfg.LatJitterWarn)  { 'Excellent' }
+                       elseif ($jitter -lt $cfg.LatJitterFail) { 'Moyen — surveiller' }
+                       else { 'Eleve — probleme probable' }
+
+        Write-Host ("    │  Jitter P99/Min ({0,-22})    : {1,8:N1} x              │" -f $jitterLabel, $jitter) -ForegroundColor $jitterColor
+        Write-Host ("    │  Outliers (>2x moy)                      : {0,5} echant. ({1:N1}%)    │" -f $outliers, $outlierPct) -ForegroundColor Cyan
+        Write-Host "    │                                                                    │" -ForegroundColor DarkGray
+        Write-Host "    │  LEGENDE :                                                         │" -ForegroundColor DarkGray
+        Write-Host "    │  Min  = baseline hardware (sans preemption OS)                     │" -ForegroundColor DarkGray
+        Write-Host "    │  P95/P99 = queue de latence, revele les interruptions rares         │" -ForegroundColor DarkGray
+        Write-Host "    │  Jitter = P99/Min, ratio de regularite (1x=parfait, >3x=warn)      │" -ForegroundColor DarkGray
+        Write-Host "    │  Outliers = pics de latence > 2x moy (DPC, IRQ, autre processus)   │" -ForegroundColor DarkGray
+        Write-Host "    └────────────────────────────────────────────────────────────────────┘" -ForegroundColor Cyan
+
+        # ── Mini histogramme ASCII ────────────────────────────────────────────
+        Write-Host ""
+        Write-Host "    Distribution (histogramme, $samples points) :" -ForegroundColor DarkGray
+        $buckets = 10
+        $bMin = $minL
+        $bMax = [Math]::Max($maxL, $minL + 0.001)
+        $bWidth = ($bMax - $bMin) / $buckets
+        $counts = @(0) * $buckets
+        foreach ($v in $lat) {
+            $b = [Math]::Min([int](($v - $bMin) / $bWidth), $buckets - 1)
+            $counts[$b]++
+        }
+        $maxCount = ($counts | Measure-Object -Maximum).Maximum
+        for ($b = 0; $b -lt $buckets; $b++) {
+            $lo   = $bMin + $b * $bWidth
+            $hi   = $lo + $bWidth
+            $barLen = if ($counts[$b] -gt 0) { [Math]::Max(1, [int]($counts[$b] / $maxCount * 40)) } else { 0 }
+            $bar  = '#' * $barLen
+            $pct  = [Math]::Round($counts[$b] / $samples * 100, 0)
+            if ($counts[$b] -gt 0) {
+                Write-Host ("    {0,6:N2}-{1,6:N2}ms | {2,-40} {3,3}% ({4})" `
+                    -f $lo, $hi, $bar, $pct, $counts[$b]) -ForegroundColor DarkGray
+            }
+        }
+        Write-Host ""
+    }
+
+    # ── Statuts ───────────────────────────────────────────────────────────────
+    $stAvg    = if ($avg -lt $cfg.LatMoyMax) { 'OK' } else { 'WARN' }
+    $stJitter = if ($jitter -lt $cfg.LatJitterWarn)  { 'OK' }
+                elseif ($jitter -lt $cfg.LatJitterFail) { 'WARN' }
+                else { 'FAIL' }
+
+    $detailFull = ("Min={0:N2}ms Avg={1:N2}ms P50={2:N2}ms P95={3:N2}ms P99={4:N2}ms Max={5:N2}ms Jitter={6:N1}x Outliers={7} ({8:N1}%)" `
+        -f $minL, $avg, $p50, $p95, $p99, $maxL, $jitter, $outliers, $outlierPct)
+    if ($freqInfo) { $detailFull += " | $freqInfo" }
+
+    Add-Result 'CPU Scheduling (moy)'    $stAvg    ("{0:N2} ms" -f $avg)        $detailFull | Out-Null
+    Add-Result 'CPU Scheduling (jitter)' $stJitter ("Jitter {0:N1}x" -f $jitter) $detailFull | Out-Null
 
     $script:LatSamples = $lat
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 # TEST 3 — WHEA
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 function Invoke-WheaTest {
     Write-Section "WHEA — Erreurs materielles"
 
@@ -311,92 +1172,169 @@ function Invoke-WheaTest {
         return
     }
 
-    $wheaEvents = @()
-    try {
-        $wheaEvents = @(Get-WinEvent -FilterHashtable @{
-            LogName      = 'System'
-            ProviderName = 'Microsoft-Windows-WHEA-Logger'
-            Id           = 17,18,19,20,41,4101
-        } -MaxEvents 50 -ErrorAction SilentlyContinue)
-    } catch { $wheaEvents = @() }
+    $wheaCount    = 0
+    $wheaCritical = 0
+    $wheaDetail   = ''
 
-    $wheaCount    = $wheaEvents.Count
-    $wheaCritical = @($wheaEvents | Where-Object { $_.Id -eq 41 }).Count
+    # 1. psloglist64.exe (optionnel, dans Tools\)
+    # Notes techniques :
+    #   - $ErrorActionPreference='Stop' global ferait planter sur exit-code non-zero
+    #     => on force 'Continue' localement + on capture stderr via 2>&1
+    #   - psloglist64 scanne un journal par NOM (pas par provider) => "System"
+    #   - On filtre ensuite les lignes contenant "WHEA" dans la sortie texte
+    #   - -accepteula enregistre la licence en registre sans popup bloquant
+    $psLog = Join-Path $PSScriptRoot 'Tools\psloglist64.exe'
+    if (Test-Path $psLog) {
+        Write-Info "Scan WHEA via psloglist64.exe..." -color 'DarkGray'
+        try {
+            # Neutraliser Stop localement : psloglist64 peut retourner exit!=0
+            # meme en cas de succes (EULA 1er lancement, journal vide, etc.)
+            $savedEAP = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            $logOut = & $psLog -accepteula System -n 200 2>&1
+            $ErrorActionPreference = $savedEAP
 
-    if ($wheaCount -gt 0) {
-        $wheaEvents | Select-Object -First 3 | ForEach-Object {
-            $msg = if ($_.Message) { $_.Message.Substring(0,[Math]::Min(80,$_.Message.Length)) } else { '(no message)' }
-            Write-Info "[$(  $_.TimeCreated.ToString('dd/MM HH:mm'))] Id=$($_.Id) $msg" -color 'DarkYellow'
+            # $logOut peut contenir des ErrorRecord (stderr) — on les ignore
+            $logLines = $logOut | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }
+
+            if ($logLines.Count -eq 0) {
+                # Peut arriver si EULA vient d etre acceptee (1er lancement)
+                # On relance une fois sans -accepteula
+                $ErrorActionPreference = 'Continue'
+                $logOut   = & $psLog System -n 200 2>&1
+                $ErrorActionPreference = $savedEAP
+                $logLines = $logOut | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }
+            }
+
+            # Filtrer les lignes WHEA-Logger dans la sortie texte
+            $wheaLines    = $logLines | Where-Object { $_ -match 'WHEA' }
+            $wheaCount    = $wheaLines.Count
+            $wheaCritical = ($wheaLines | Where-Object { $_ -match '(Critical|Error)' }).Count
+            $wheaDetail   = if ($wheaLines.Count -gt 0) {
+                "psloglist64: $wheaCount evt(s) WHEA"
+            } elseif ($logLines.Count -gt 0) {
+                "psloglist64 OK — aucun evt WHEA"
+            } else {
+                # Vide apres 2 tentatives => laisser Get-WinEvent prendre le relais
+                ''
+            }
+            Write-Verbose "psloglist64 : $($logLines.Count) lignes, $wheaCount WHEA"
+        }
+        catch {
+            # Ne jamais bloquer sur psloglist64 — Get-WinEvent prend le relais
+            Write-Verbose "psloglist64 exception : $($_.Exception.Message)"
+            $wheaDetail = ''
+        }
+    }
+
+    # 2. Fallback Get-WinEvent si psloglist64 absent, vide ou en echec
+    # wheaDetail='' = psloglist64 n a pas fourni de resultat => fallback necessaire
+    # wheaDetail='psloglist64 OK' = scan reussi, 0 erreur WHEA => pas de fallback
+    $pslogReussi = $wheaDetail -ne '' -and $wheaDetail -notmatch '^$'
+    if (-not $pslogReussi) {
+        try {
+            Write-Info "Fallback WHEA via Get-WinEvent..." -color 'DarkGray'
+            $wheaEvents = @(Get-WinEvent -FilterHashtable @{
+                LogName      = 'System'
+                ProviderName = 'Microsoft-Windows-WHEA-Logger'
+                Id           = 17, 18, 19, 20, 41, 4101
+            } -MaxEvents 100 -ErrorAction SilentlyContinue)
+
+            $wheaCount    = $wheaEvents.Count
+            $wheaCritical = @($wheaEvents | Where-Object { $_.Id -eq 41 -or $_.Level -eq 1 }).Count
+
+            if ($wheaCount -gt 0) {
+                $wheaEvents | Select-Object -First 3 | ForEach-Object {
+                    $msg = if ($_.Message) {
+                        $_.Message.Substring(0, [Math]::Min(80, $_.Message.Length))
+                    } else { '(no message)' }
+                    $wheaDetail += "[$($_.TimeCreated.ToString('dd/MM HH:mm'))] Id=$($_.Id) $msg; "
+                }
+            }
+        }
+        catch {
+            Write-Verbose "Get-WinEvent WHEA echec : $($_.Exception.Message)"
+            $wheaDetail += " WinEvent fallback echec"
         }
     }
 
     $stTotal = if ($wheaCount    -eq 0) { 'OK' } else { 'WARN' }
     $stCrit  = if ($wheaCritical -eq 0) { 'OK' } else { 'FAIL' }
+    $vTot    = "Total: $wheaCount | Critique: $wheaCritical"
 
-    Write-Info "Total: $wheaCount | Critique (id=41): $wheaCritical" -color (Get-StatusColor $stTotal)
-    Add-Result 'WHEA total'    $stTotal "$wheaCount evenement(s)"          '' | Out-Null
-    Add-Result 'WHEA critique' $stCrit  "$wheaCritical evenement(s) id=41" '' | Out-Null
+    Write-Info "Resultat WHEA : $vTot" -color (Get-StatusColor $stTotal)
+    Add-Result 'WHEA total'    $stTotal $vTot             $wheaDetail       | Out-Null
+    Add-Result 'WHEA critique' $stCrit  "$wheaCritical evenement(s)" 'Seuil zero tolerance' | Out-Null
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPER OHM — lance OHM si present a cote du script, attend le WMI
-# Retourne le Process lance (ou $null si non necessaire / deja actif)
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
+# LANCEMENT OHM SI PRESENT
+#─────────────────────────────────────────────────────────────────────────────
 function Start-OhmIfNeeded {
-    # Deja actif ?
+    # Verifier si capteurs WMI deja actifs
     try {
-        $test = Get-CimInstance -Namespace 'root/OpenHardwareMonitor' -ClassName Sensor -ErrorAction Stop |
-                Select-Object -First 1
-        if ($test) { return $null }   # WMI OHM deja expose, rien a faire
-    } catch { }
-
-    # Cherche OHM.exe dans le meme dossier que le script
-    #$ohmExe = Join-Path (Split-Path $PSCommandPath -Parent) 'OpenHardwareMonitor.exe'
-    $ohmExe = Join-Path $PSScriptRoot 'OpenHardwareMonitor.exe'
-    if (-not (Test-Path $ohmExe)) { return $null }
-
-    if (-not $IsAdmin) {
-        Write-Info "! OHM detecte mais admin requis pour le lancer (WMI)" -color 'DarkYellow'
-        return $null
-    }
-
-    Write-Info "OHM detecte — lancement automatique..." -color 'DarkGray'
-    try {
-        $proc = Start-Process -FilePath $ohmExe -PassThru -WindowStyle Minimized -ErrorAction Stop
-        # Attente WMI OHM — max 8 secondes
-        $deadline = (Get-Date).AddSeconds(8)
-        $ready = $false
-        while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Milliseconds 500
-            try {
-                $chk = Get-CimInstance -Namespace 'root/OpenHardwareMonitor' -ClassName Sensor -ErrorAction Stop |
-                       Select-Object -First 1
-                if ($chk) { $ready = $true; break }
-            } catch { }
-        }
-        if ($ready) {
-            Write-Info "OHM WMI actif." -color 'DarkGray'
-            return $proc
-        } else {
-            Write-Info "! OHM lance mais WMI non disponible apres 8s." -color 'DarkYellow'
-            try { $proc.Kill() } catch { }
+        $sensor = Get-CimInstance -Namespace 'root/OpenHardwareMonitor' -ClassName Sensor -ErrorAction Stop |
+                  Where-Object { $_.SensorType -eq 'Temperature' -and $_.Identifier -match '/cpu/' } |
+                  Select-Object -First 1
+        if ($sensor -and $sensor.Value -gt 0) {
+            Write-Info "WMI capteurs deja actifs (CPU OK)." -color 'DarkGray'
             return $null
         }
-    } catch {
-        Write-Info "! Impossible de lancer OHM : $($_.Exception.Message)" -color 'DarkYellow'
+    }
+    catch { Write-Verbose "OHM WMI check : $($_.Exception.Message)" }
+
+    # Chercher OHM
+    $ohmExe = Join-Path $PSScriptRoot 'OpenHardwareMonitor.exe'
+    if (-not (Test-Path $ohmExe)) {
+        $ohmExe = Join-Path (Join-Path $PSScriptRoot 'Tools') 'OpenHardwareMonitor.exe'
+    }
+    if (-not (Test-Path $ohmExe)) {
+        Write-Info "! OpenHardwareMonitor.exe introuvable (optionnel)." -color 'DarkGray'
         return $null
     }
+    if (-not $IsAdmin) {
+        Write-Info "! Admin requis pour OHM." -color 'DarkYellow'
+        return $null
+    }
+
+    Write-Info "OHM lancement..." -color 'DarkGray'
+    # Tuer un eventuel zombie
+    Get-Process OpenHardwareMonitor -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+
+    $proc = Start-Process -FilePath $ohmExe -ArgumentList "/remote" -WindowStyle Hidden -PassThru -ErrorAction Stop
+    Write-Info "OHM demarre (PID $($proc.Id)) — attente capteurs CPU (max $($cfg.OhmTimeoutSec)s)..." -color 'DarkGray'
+
+    $deadline = (Get-Date).AddSeconds($cfg.OhmTimeoutSec)
+    $ready    = $false
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 500
+        try {
+            $sensor = Get-CimInstance -Namespace 'root/OpenHardwareMonitor' -ClassName Sensor -ErrorAction Stop |
+                      Where-Object { $_.SensorType -eq 'Temperature' -and $_.Identifier -match '/cpu/' } |
+                      Select-Object -First 1
+            if ($sensor -and $sensor.Value -gt 0) { $ready = $true; break }
+        }
+        catch { Write-Verbose "OHM attente : $($_.Exception.Message)" }
+    }
+
+    if ($ready) {
+        Write-Info "OHM OK — capteurs CPU disponibles." -color 'DarkGray'
+    }
+    else {
+        Write-Info "! OHM lance mais capteurs non prets (timeout)." -color 'DarkYellow'
+    }
+    return $proc
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 # TEST 4 — TEMPERATURE avec chaine de fallback complete
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 function Invoke-TempTest {
     Write-Section "TEMPERATURE CPU"
 
-    $celsius  = $null
-    $src      = 'inconnu'
-    $ohmProc  = Start-OhmIfNeeded   # lance OHM si present et WMI pas encore dispo
+    $celsius = $null
+    $src     = 'inconnu'
 
     # 1. MSAcpi_ThermalZoneTemperature (ACPI natif, admin requis)
     if ($IsAdmin) {
@@ -404,10 +1342,12 @@ function Invoke-TempTest {
             $raw = (Get-CimInstance -Namespace 'root/WMI' -ClassName MSAcpi_ThermalZoneTemperature `
                     -ErrorAction Stop | Select-Object -First 1).CurrentTemperature
             if ($null -ne $raw -and $raw -gt 0) {
-                $celsius = [Math]::Round(($raw - 2732) / 10.0, 1)
+                # FIX : valeur en dixiemes de Kelvin — division par 10, pas soustraction de 2732
+                $celsius = [Math]::Round($raw / 10.0 - 273.15, 1)
                 $src     = 'ACPI (MSAcpi)'
             }
-        } catch { }
+        }
+        catch { Write-Verbose "ACPI ThermalZone : $($_.Exception.Message)" }
     }
 
     # 2. Win32_PerfFormattedData_Counters_ThermalZoneInformation (Windows 11 natif)
@@ -420,56 +1360,45 @@ function Invoke-TempTest {
                 $celsius = [Math]::Round($tz.Temperature / 10.0 - 273.15, 1)
                 $src     = 'ThermalZone (Win11 natif)'
             }
-        } catch { }
+        }
+        catch { Write-Verbose "ThermalZoneInfo : $($_.Exception.Message)" }
     }
 
-    # 3. OpenHardwareMonitor WMI (bundlé dans le repo)
+    # 3. OpenHardwareMonitor WMI
     if ($null -eq $celsius) {
         try {
             $ohm = Get-CimInstance -Namespace 'root/OpenHardwareMonitor' -ClassName Sensor `
-                   -ErrorAction Stop |
+                    -ErrorAction Stop |
                    Where-Object { $_.SensorType -eq 'Temperature' -and $_.Name -match 'CPU|Package|Core|Tdie|Tctl' } |
                    Sort-Object Value -Descending | Select-Object -First 1
             if ($ohm -and $ohm.Value -gt 0) {
                 $celsius = [Math]::Round($ohm.Value, 1)
                 $src     = "OHM: $($ohm.Name)"
             }
-        } catch { }
-    }
-
-    # 4. LibreHardwareMonitor WMI (si installé)
-    if ($null -eq $celsius) {
-        try {
-            $lhm = Get-CimInstance -Namespace 'root/LibreHardwareMonitor' -ClassName Sensor `
-                   -ErrorAction Stop |
-                   Where-Object { $_.SensorType -eq 'Temperature' -and $_.Name -match 'CPU|Package|Core' } |
-                   Sort-Object Value -Descending | Select-Object -First 1
-            if ($lhm -and $lhm.Value -gt 0) {
-                $celsius = [Math]::Round($lhm.Value, 1)
-                $src     = "LHM: $($lhm.Name)"
-            }
-        } catch { }
+        }
+        catch { Write-Verbose "OHM WMI Temp : $($_.Exception.Message)" }
     }
 
     if ($null -ne $celsius -and $celsius -gt 0 -and $celsius -lt 150) {
-        $st = if ($celsius -lt $cfg.TempCPUMax) { 'OK' }
+        $st = if ($celsius -lt $cfg.TempCPUMax)           { 'OK' }
               elseif ($celsius -lt ($cfg.TempCPUMax + 10)) { 'WARN' }
-              else { 'FAIL' }
+              else                                          { 'FAIL' }
         Write-Info "CPU : ${celsius}°C  [source: $src]" -color (Get-StatusColor $st)
         Add-Result 'Temperature CPU' $st "${celsius}°C" "Source: $src" | Out-Null
-    } else {
-        Write-Info "! Temperature indisponible. Lancez OpenHardwareMonitor.exe (inclus) ou LibreHardwareMonitor." -color 'DarkYellow'
-        Add-Result 'Temperature CPU' 'N/A' 'Source indisponible' 'Lancer OHM ou LHM avec WMI active' | Out-Null
+    }
+    else {
+        Write-Info "! Temperature indisponible. Placez OpenHardwareMonitor.exe dans le dossier Tools\." -color 'DarkYellow'
+        Add-Result 'Temperature CPU' 'N/A' 'Source indisponible' 'Lancer OpenHardwareMonitor.exe avec WMI active' | Out-Null
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 5 — DISQUES : espace + SMART via StorageReliabilityCounter + vitesse I/O
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
+# TEST 5 — DISQUES : espace + SMART + vitesse I/O
+#─────────────────────────────────────────────────────────────────────────────
 function Invoke-DisqueTest {
     Write-Section "DISQUES — Espace + SMART + vitesse I/O"
 
-    # Espace
+    # ── Espace libre ──────────────────────────────────────────────────────────
     $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $null -ne $_.Used -and $null -ne $_.Free }
     foreach ($d in $drives) {
         $total = $d.Used + $d.Free
@@ -481,74 +1410,284 @@ function Invoke-DisqueTest {
         Add-Result "Disque $($d.Name):" $st "${pct}% utilise" "${freeG} Go libres" | Out-Null
     }
 
-    # SMART — Get-PhysicalDisk + Get-StorageReliabilityCounter
+    # ── SMART ─────────────────────────────────────────────────────────────────
     Write-Info "--- SMART ---" -color 'DarkGray'
-    try {
-        $physDisks = Get-PhysicalDisk -ErrorAction Stop
-        foreach ($disk in $physDisks) {
+
+    if (-not $IsAdmin) {
+        Write-Info "! Droits admin requis pour SMART" -color 'DarkYellow'
+        Add-Result 'SMART global' 'N/A' 'Admin requis' 'Relancer en administrateur' | Out-Null
+    }
+    else {
+        $toolsDir    = Join-Path $PSScriptRoot 'Tools'
+        $smartctlExe = Join-Path $toolsDir 'smartctl.exe'
+        $smartDone   = $false
+
+        # 1. smartctl.exe
+        if (Test-Path $smartctlExe) {
             try {
-                $rel  = $disk | Get-StorageReliabilityCounter -ErrorAction Stop
-                $name = if ($disk.FriendlyName) { $disk.FriendlyName } else { $disk.DeviceId }
-                $health = $disk.HealthStatus
+                $scanOut  = & $smartctlExe --scan-open 2>&1
+                $devLines = @($scanOut | Where-Object { $_ -match '^/dev/' })
 
-                $parts = @()
-                if ($rel.Wear -gt 0) { $parts += "Wear:$($rel.Wear)%" }
-                if ($rel.Temperature -gt 0) { $parts += "Temp:$($rel.Temperature)°C" }
-                if ($rel.ReadErrorsTotal -gt 0) { $parts += "RdErr:$($rel.ReadErrorsTotal)" }
-                if ($null -ne $rel.WriteErrorsUncorrected -and $rel.WriteErrorsUncorrected -gt 0) {
-                    $parts += "WrErr:$($rel.WriteErrorsUncorrected)"
+                if ($devLines.Count -eq 0) {
+                    $scanOut  = & $smartctlExe --scan 2>&1
+                    $devLines = @($scanOut | Where-Object { $_ -match '^/dev/' })
                 }
-                if ($null -ne $rel.MediaErrors -and $rel.MediaErrors -gt 0) {
-                    $parts += "MediaErr:$($rel.MediaErrors)"
+
+                foreach ($devLine in $devLines) {
+                    $dev = ($devLine -split '\s')[0]
+                    try {
+                        $infoJson = & $smartctlExe -a -j $dev 2>&1
+                        $info     = $infoJson | ConvertFrom-Json -ErrorAction Stop
+
+                        $dname  = if ($info.model_name)    { $info.model_name }
+                                  elseif ($info.device.name) { $info.device.name }
+                                  else                        { $dev }
+
+                        $health = if ($info.smart_status.passed -eq $true) { 'PASSED' } else { 'FAILED' }
+                        $temp   = if ($info.temperature.current)  { "$($info.temperature.current)°C" } else { '?' }
+
+                        $reallocatedAttr = $info.ata_smart_attributes.table | Where-Object { $_.id -eq 5   } | Select-Object -First 1
+                        $pendingAttr     = $info.ata_smart_attributes.table | Where-Object { $_.id -eq 197 } | Select-Object -First 1
+                        $udmaAttr        = $info.ata_smart_attributes.table | Where-Object { $_.id -eq 199 } | Select-Object -First 1
+
+                        $reallocated = if ($reallocatedAttr -and $reallocatedAttr.raw.value -gt 0) {
+                            $reallocatedAttr.raw.value
+                        } elseif ($reallocatedAttr -and $reallocatedAttr.raw.string) {
+                            [long]($reallocatedAttr.raw.string -replace '[^\d]', '')
+                        } else { 0 }
+
+                        $pending = if ($pendingAttr -and $pendingAttr.raw.value -gt 0) {
+                            $pendingAttr.raw.value
+                        } elseif ($pendingAttr -and $pendingAttr.raw.string) {
+                            [long]($pendingAttr.raw.string -replace '[^\d]', '')
+                        } else { 0 }
+
+                        $udmaCrc = if ($udmaAttr -and $udmaAttr.raw.value -gt 0) {
+                            $udmaAttr.raw.value
+                        } elseif ($udmaAttr -and $udmaAttr.raw.string) {
+                            [long]($udmaAttr.raw.string -replace '[^\d]', '')
+                        } else { 0 }
+
+                        $nvmeLog = $info.nvme_smart_health_information_log
+                        $nvmePE  = if ($nvmeLog) { $nvmeLog.percentage_used } else { $null }
+                        $nvmeME  = if ($nvmeLog) { $nvmeLog.media_errors }    else { $null }
+
+                        $pts = @("Sante:$health", "Temp:$temp")
+                        if ($reallocated -gt 0) { $pts += "Reallocated:$reallocated" }
+                        if ($pending     -gt 0) { $pts += "Pending:$pending" }
+                        if ($udmaCrc     -gt 0) { $pts += "UDMA_CRC:$udmaCrc" }
+                        if ($nvmeME -and [long]$nvmeME -gt 0) { $pts += "NVMe-MediaErr:$nvmeME" }
+                        if ($nvmePE -and [int]$nvmePE  -gt 0) { $pts += "UsedLife:${nvmePE}%" }
+
+                        $detailStr = $pts -join ' | '
+
+                        $st = 'OK'
+                        if ($health      -eq 'FAILED')                          { $st = 'FAIL' }
+                        if ($pending     -gt 5)                                  { $st = 'FAIL' }
+                        elseif ($reallocated -gt 0)                              { if ($st -ne 'FAIL') { $st = 'WARN' } }
+                        if ($udmaCrc     -gt 1)                                  { if ($st -ne 'FAIL') { $st = 'WARN' } }
+                        if ($nvmeME -and [long]$nvmeME -gt 0)                   { $st = 'FAIL' }
+                        if ($nvmePE -and [int]$nvmePE  -gt 90)                  { $st = 'FAIL' }
+                        elseif ($nvmePE -and [int]$nvmePE -gt 75 -and $st -ne 'FAIL') { $st = 'WARN' }
+
+                        Write-Info "$dname : [$health] $temp — $detailStr" -color (Get-StatusColor $st)
+                        Add-Result "SMART: $dname" $st "[$health] $temp" $detailStr | Out-Null
+                        $smartDone = $true
+                    }
+                    catch {
+                        # Fallback texte si JSON echoue
+                        try {
+                            $txtOut  = & $smartctlExe -a $dev 2>&1
+                            $pending = ($txtOut | Select-String "Current_Pending_Sector"  | ForEach-Object { ($_ -split '\s+')[-1] }) -as [int]
+                            $realloc = ($txtOut | Select-String "Reallocated_Sector_Ct"   | ForEach-Object { ($_ -split '\s+')[-1] }) -as [int]
+                            $uncorr  = ($txtOut | Select-String "Offline_Uncorrectable"   | ForEach-Object { ($_ -split '\s+')[-1] }) -as [int]
+
+                            $pts = @()
+                            if ($realloc -gt 0) { $pts += "Reallocated:$realloc" }
+                            if ($pending -gt 0) { $pts += "Pending:$pending" }
+                            if ($uncorr  -gt 0) { $pts += "Uncorrectable:$uncorr" }
+                            $detailStr = if ($pts.Count -gt 0) { $pts -join ' | ' } else { 'OK' }
+
+                            $st = 'OK'
+                            if ($pending -gt 5 -or $uncorr -gt 0) { $st = 'FAIL' }
+                            elseif ($realloc -gt 0)                { $st = 'WARN' }
+
+                            Write-Info "$dev : $detailStr" -color (Get-StatusColor $st)
+                            Add-Result "SMART: $dev" $st $detailStr "smartctl -a fallback" | Out-Null
+                            $smartDone = $true
+                        }
+                        catch {
+                            Write-Info "! smartctl echec pour $dev : $($_.Exception.Message)" -color 'DarkYellow'
+                            Add-Result "SMART: $dev" 'N/A' 'smartctl echec' $_.Exception.Message | Out-Null
+                        }
+                    }
                 }
-                $detailStr = if ($parts.Count -gt 0) { $parts -join ' | ' } else { 'Pas d anomalie detectee' }
 
-                $st = 'OK'
-                if ($health -ne 'Healthy') { $st = 'WARN' }
-                if ($null -ne $rel.WriteErrorsUncorrected -and $rel.WriteErrorsUncorrected -gt 0) { $st = 'FAIL' }
-                if ($null -ne $rel.MediaErrors -and $rel.MediaErrors -gt 5) { $st = 'FAIL' }
-                if ($rel.Wear -gt 90) { $st = 'FAIL' } elseif ($rel.Wear -gt 75) { $st = 'WARN' }
-
-                $valStr = "[$health]"
-                if ($rel.Wear -gt 0) { $valStr += " Wear=$($rel.Wear)%" }
-
-                Write-Info "$name : $valStr — $detailStr" -color (Get-StatusColor $st)
-                Add-Result "SMART: $name" $st $valStr $detailStr | Out-Null
-            } catch {
-                Add-Result "SMART: $($disk.FriendlyName)" 'N/A' 'Non supporte' 'Driver incompatible' | Out-Null
+                if ($devLines.Count -eq 0) {
+                    Write-Info "! smartctl --scan : aucun disque detecte" -color 'DarkYellow'
+                }
+            }
+            catch {
+                Write-Info "! smartctl.exe erreur : $($_.Exception.Message)" -color 'DarkYellow'
             }
         }
-    } catch {
-        Write-Info "! Get-PhysicalDisk indisponible." -color 'DarkYellow'
-        Add-Result 'SMART global' 'N/A' 'Indisponible' 'Get-PhysicalDisk non supporte' | Out-Null
+
+        # 2. Fallback StorageReliabilityCounter si smartctl absent ou echec total
+        if (-not $smartDone) {
+            try {
+                $physDisks = Get-PhysicalDisk -ErrorAction Stop
+                if (-not $physDisks) {
+                    Write-Info "! Aucun disque detecte via Get-PhysicalDisk." -color 'DarkYellow'
+                    Add-Result 'SMART global' 'N/A' 'Aucun disque detecte' 'Placez smartctl.exe dans Tools\' | Out-Null
+                }
+                foreach ($disk in $physDisks) {
+                    $dname = if ($disk.FriendlyName) { $disk.FriendlyName } else { "Disk $($disk.DeviceId)" }
+                    try {
+                        $rel    = $disk | Get-StorageReliabilityCounter -ErrorAction Stop
+                        $health = $disk.HealthStatus
+                        $parts  = @()
+                        if ($rel.PSObject.Properties['Wear']                   -and $rel.Wear                   -gt 0) { $parts += "Wear:$($rel.Wear)%" }
+                        if ($rel.PSObject.Properties['Temperature']             -and $rel.Temperature             -gt 0) { $parts += "Temp:$($rel.Temperature)°C" }
+                        if ($rel.PSObject.Properties['ReadErrorsTotal']         -and $rel.ReadErrorsTotal         -gt 0) { $parts += "RdErr:$($rel.ReadErrorsTotal)" }
+                        if ($rel.PSObject.Properties['WriteErrorsUncorrected']  -and $null -ne $rel.WriteErrorsUncorrected -and $rel.WriteErrorsUncorrected -gt 0) { $parts += "WrErr:$($rel.WriteErrorsUncorrected)" }
+                        if ($rel.PSObject.Properties['MediaErrors']             -and $null -ne $rel.MediaErrors   -and $rel.MediaErrors -gt 0) { $parts += "MediaErr:$($rel.MediaErrors)" }
+                        $detailStr = if ($parts.Count -gt 0) { $parts -join ' | ' } else { 'Pas d anomalie detectee' }
+
+                        $st = 'OK'
+                        if ($health -ne 'Healthy') { $st = 'WARN' }
+                        if ($rel.PSObject.Properties['WriteErrorsUncorrected'] -and $null -ne $rel.WriteErrorsUncorrected -and $rel.WriteErrorsUncorrected -gt 0) { $st = 'FAIL' }
+                        if ($rel.PSObject.Properties['MediaErrors']            -and $null -ne $rel.MediaErrors   -and $rel.MediaErrors -gt 5) { $st = 'FAIL' }
+                        if ($rel.PSObject.Properties['Wear'] -and $rel.Wear -gt 90)                             { $st = 'FAIL' }
+                        elseif ($rel.PSObject.Properties['Wear'] -and $rel.Wear -gt 75 -and $st -ne 'FAIL')    { $st = 'WARN' }
+
+                        $valStr = "[$health]"
+                        if ($rel.PSObject.Properties['Wear'] -and $rel.Wear -gt 0) { $valStr += " Wear=$($rel.Wear)%" }
+
+                        Write-Info "$dname : $valStr — $detailStr" -color (Get-StatusColor $st)
+                        Add-Result "SMART: $dname" $st $valStr $detailStr | Out-Null
+                    }
+                    catch {
+                        Write-Info "! SMART indispo pour $dname : $($_.Exception.Message)" -color 'DarkYellow'
+                        Add-Result "SMART: $dname" 'N/A' 'Non supporte' "Placez smartctl.exe dans Tools\ pour eviter cette erreur" | Out-Null
+                    }
+                }
+            }
+            catch {
+                $errMsg = $_.Exception.Message
+                Write-Info "! Get-PhysicalDisk indisponible : $errMsg" -color 'DarkYellow'
+                Add-Result 'SMART global' 'N/A' 'Indisponible' $errMsg | Out-Null
+            }
+        }
     }
 
-    # Vitesse I/O
+    # ── Vitesse I/O ───────────────────────────────────────────────────────────
     Write-Info "--- Vitesse I/O ---" -color 'DarkGray'
-    $tmpFile = [System.IO.Path]::GetTempFileName()
-    try {
-        $buf = [byte[]]::new([int](50 * 1MB))
-        [System.Random]::new().NextBytes($buf)
-        $sw = [System.Diagnostics.Stopwatch]::StartNew()
-        [System.IO.File]::WriteAllBytes($tmpFile, $buf)
-        $sw.Stop()
-        $mbps = [Math]::Round(50 / $sw.Elapsed.TotalSeconds, 0)
-        $st   = if ($mbps -gt $cfg.DiskWriteMin) { 'OK' } elseif ($mbps -gt 30) { 'WARN' } else { 'FAIL' }
-        Write-Info "Ecriture sequentielle : ${mbps} Mo/s" -color (Get-StatusColor $st)
-        Add-Result 'Disque — Ecriture' $st "${mbps} Mo/s" 'Fichier temp 50 Mo' | Out-Null
-    } catch {
-        Add-Result 'Disque — Ecriture' 'N/A' 'Erreur I/O' $_.Exception.Message | Out-Null
-    } finally {
-        Remove-Item $tmpFile -ErrorAction SilentlyContinue
+
+    $ddExe    = Join-Path (Join-Path $PSScriptRoot 'Tools') 'dd.exe'
+    $testFile = Join-Path $env:TEMP "occt81_disktest_$([System.Diagnostics.Process]::GetCurrentProcess().Id).dat"
+    $testSizeBytes = [long]($cfg.DiskTestSizeMB) * 1MB
+    $count    = $cfg.DiskTestSizeMB
+
+    if (Test-Path $ddExe) {
+        # ── dd.exe present ────────────────────────────────────────────────────
+        try {
+            Write-Info "Ecriture sequentielle (dd.exe, $($cfg.DiskTestSizeMB) Mo)..." -color 'DarkGray'
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $ddWrite = & $ddExe if=/dev/zero of=$testFile bs=1M count=$count 2>&1
+            Start-Sleep -Milliseconds 200
+            $sw.Stop()
+
+            $ddOut     = $ddWrite -join ' '
+            $writeMbps = $null
+            if ($ddOut -match '(\d[\d,\.]+)\s*(bytes|octets)/sec') {
+                $writeMbps = [Math]::Round([double]($Matches[1] -replace ',', '') / 1MB, 0)
+            }
+            elseif ($sw.Elapsed.TotalSeconds -gt 0 -and (Test-Path $testFile)) {
+                $sz = (Get-Item $testFile).Length
+                $writeMbps = [Math]::Round($sz / 1MB / $sw.Elapsed.TotalSeconds, 0)
+            }
+
+            if ($null -ne $writeMbps -and $writeMbps -gt 0) {
+                $st = if ($writeMbps -gt $cfg.DiskWriteMin) { 'OK' } elseif ($writeMbps -gt 30) { 'WARN' } else { 'FAIL' }
+                Write-Info "Ecriture : ${writeMbps} Mo/s" -color (Get-StatusColor $st)
+                Add-Result 'Disque — Ecriture (dd)' $st "${writeMbps} Mo/s" "dd.exe — $($cfg.DiskTestSizeMB) Mo dans TEMP" | Out-Null
+            }
+            else {
+                Write-Info "! dd.exe ecriture : debit illisible" -color 'DarkYellow'
+                Add-Result 'Disque — Ecriture (dd)' 'N/A' 'Debit illisible' $ddOut | Out-Null
+            }
+        }
+        catch {
+            Write-Info "! dd.exe ecriture echouee : $($_.Exception.Message)" -color 'DarkYellow'
+            Add-Result 'Disque — Ecriture (dd)' 'N/A' 'Erreur dd' $_.Exception.Message | Out-Null
+        }
+
+        if (Test-Path $testFile) {
+            try {
+                Write-Info "Lecture sequentielle (dd.exe, $($cfg.DiskTestSizeMB) Mo)..." -color 'DarkGray'
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $ddRead = & $ddExe if=$testFile of=/dev/null bs=1M 2>&1
+                Start-Sleep -Milliseconds 200
+                $sw.Stop()
+
+                $ddOut    = $ddRead -join ' '
+                $readMbps = $null
+                if ($ddOut -match '(\d[\d,\.]+)\s*(bytes|octets)/sec') {
+                    $readMbps = [Math]::Round([double]($Matches[1] -replace ',', '') / 1MB, 0)
+                }
+                elseif ($sw.Elapsed.TotalSeconds -gt 0) {
+                    $readMbps = [Math]::Round($testSizeBytes / 1MB / $sw.Elapsed.TotalSeconds, 0)
+                }
+
+                if ($null -ne $readMbps -and $readMbps -gt 0) {
+                    $st = if ($readMbps -gt $cfg.DiskReadMin) { 'OK' } elseif ($readMbps -gt 50) { 'WARN' } else { 'FAIL' }
+                    Write-Info "Lecture : ${readMbps} Mo/s" -color (Get-StatusColor $st)
+                    Add-Result 'Disque — Lecture (dd)' $st "${readMbps} Mo/s" "dd.exe — $($cfg.DiskTestSizeMB) Mo dans TEMP" | Out-Null
+                }
+                else {
+                    Write-Info "! dd.exe lecture : debit illisible" -color 'DarkYellow'
+                    Add-Result 'Disque — Lecture (dd)' 'N/A' 'Debit illisible' $ddOut | Out-Null
+                }
+            }
+            catch {
+                Write-Info "! dd.exe lecture echouee : $($_.Exception.Message)" -color 'DarkYellow'
+                Add-Result 'Disque — Lecture (dd)' 'N/A' 'Erreur dd' $_.Exception.Message | Out-Null
+            }
+            Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
+        }
+    }
+    else {
+        # ── Fallback PS (dd.exe absent) ───────────────────────────────────────
+        Write-Info "(dd.exe absent — fallback ecriture PS, 50 Mo)" -color 'DarkGray'
+        try {
+            $sizeMB = 50
+            $buf    = [byte[]]::new([int]($sizeMB * 1MB))
+            [System.Random]::new().NextBytes($buf)
+
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            [System.IO.File]::WriteAllBytes($testFile, $buf)
+            $sw.Stop()
+
+            $mbps = [Math]::Round($sizeMB / $sw.Elapsed.TotalSeconds, 0)
+            $st   = if ($mbps -gt $cfg.DiskWriteMin) { 'OK' } elseif ($mbps -gt 30) { 'WARN' } else { 'FAIL' }
+            Write-Info "Ecriture : ${mbps} Mo/s" -color (Get-StatusColor $st)
+            Add-Result 'Disque — Ecriture' $st "${mbps} Mo/s" "PS fallback — dd.exe recommande" | Out-Null
+        }
+        catch {
+            Write-Info "! Ecriture echouee : $($_.Exception.Message)" -color 'DarkYellow'
+            Add-Result 'Disque — Ecriture' 'N/A' 'Erreur I/O' $_.Exception.Message | Out-Null
+        }
+        finally {
+            Remove-Item -LiteralPath $testFile -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TEST 6 — GPU : nvidia-smi → OHM → LHM → WMI fallback
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
+# TEST 6 — GPU : nvidia-smi → OHM → WMI fallback
+#─────────────────────────────────────────────────────────────────────────────
 function Invoke-GpuTest {
     Write-Section "GPU"
-
     $found = $false
 
     # 1. nvidia-smi
@@ -558,7 +1697,8 @@ function Invoke-GpuTest {
     ) | Where-Object { Test-Path $_ -ErrorAction SilentlyContinue } | Select-Object -First 1
 
     if (-not $smiPath) {
-        try { $smiPath = (Get-Command 'nvidia-smi.exe' -ErrorAction Stop).Source } catch { $smiPath = $null }
+        try { $smiPath = (Get-Command 'nvidia-smi.exe' -ErrorAction Stop).Source }
+        catch { Write-Verbose "nvidia-smi non trouve dans PATH" }
     }
 
     if ($smiPath) {
@@ -566,32 +1706,35 @@ function Invoke-GpuTest {
             $smiOut = & $smiPath `
                 --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,pstate `
                 --format=csv,noheader,nounits 2>$null
+
             foreach ($line in ($smiOut -split "`n" | Where-Object { $_.Trim() -ne '' })) {
                 $p = $line -split ',' | ForEach-Object { $_.Trim() }
                 if ($p.Count -lt 5) { continue }
+
                 $gpuName = $p[0]
-                $tempG   = if ($p[1] -match '^\d') { [int]$p[1] } else { $null }
-                $utilG   = if ($p[2] -match '^\d') { [int]$p[2] } else { $null }
-                $mU      = if ($p[3] -match '^\d') { [int]$p[3] } else { $null }
-                $mT      = if ($p[4] -match '^\d') { [int]$p[4] } else { $null }
+                $tempG   = if ($p[1] -match '^\d') { [int]$p[1] }    else { $null }
+                $utilG   = if ($p[2] -match '^\d') { [int]$p[2] }    else { $null }
+                $mU      = if ($p[3] -match '^\d') { [int]$p[3] }    else { $null }
+                $mT      = if ($p[4] -match '^\d') { [int]$p[4] }    else { $null }
                 $pw      = if ($p.Count -gt 5 -and $p[5] -match '^\d') { [double]$p[5] } else { $null }
 
                 $st = 'OK'
-                if ($tempG -and $tempG -gt $cfg.TempGPUMax)          { $st = 'FAIL' }
-                elseif ($tempG -and $tempG -gt ($cfg.TempGPUMax-10)) { $st = 'WARN' }
+                if ($tempG -and $tempG -gt $cfg.TempGPUMax)              { $st = 'FAIL' }
+                elseif ($tempG -and $tempG -gt ($cfg.TempGPUMax - 10))   { $st = 'WARN' }
 
                 $val = if ($tempG) { "${tempG}°C" } else { 'N/A' }
                 $det = ''
-                if ($null -ne $utilG) { $det += "Load:${utilG}% " }
-                if ($mU -and $mT)     { $det += "VRAM:${mU}/${mT}MiB " }
-                if ($null -ne $pw)    { $det += "Pwr:$([Math]::Round($pw,1))W " }
+                if ($null -ne $utilG) { $det += "Load:${utilG}%  " }
+                if ($mU -and $mT)     { $det += "VRAM:${mU}/${mT}MiB  " }
+                if ($null -ne $pw)    { $det += "Pwr:$([Math]::Round($pw,1))W  " }
                 $det += '| nvidia-smi'
 
                 Write-Info "$gpuName : $val | $det" -color (Get-StatusColor $st)
                 Add-Result "GPU: $gpuName" $st $val $det | Out-Null
                 $found = $true
             }
-        } catch { }
+        }
+        catch { Write-Verbose "nvidia-smi echec : $($_.Exception.Message)" }
     }
 
     # 2. OHM WMI
@@ -607,25 +1750,11 @@ function Invoke-GpuTest {
                     $found = $true
                 }
             }
-        } catch { }
+        }
+        catch { Write-Verbose "OHM GPU : $($_.Exception.Message)" }
     }
 
-    # 3. LHM WMI
-    if (-not $found) {
-        try {
-            $lhmSensors = @(Get-CimInstance -Namespace 'root/LibreHardwareMonitor' -ClassName Sensor -ErrorAction Stop |
-                Where-Object { $_.SensorType -eq 'Temperature' -and $_.Name -match 'GPU' })
-            foreach ($g in $lhmSensors) {
-                if ($g.Value -gt 0) {
-                    $st = if ($g.Value -lt $cfg.TempGPUMax) { 'OK' } else { 'WARN' }
-                    Add-Result "GPU Temp: $($g.Name)" $st "$([Math]::Round($g.Value,1))°C" 'Source: LHM' | Out-Null
-                    $found = $true
-                }
-            }
-        } catch { }
-    }
-
-    # 4. Fallback Win32_VideoController (info driver, pas de temperature)
+    # 3. Fallback Win32_VideoController (info driver, pas de temperature)
     if (-not $found) {
         try {
             $gpus = Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop
@@ -635,15 +1764,17 @@ function Invoke-GpuTest {
                 Write-Info "$($g.Name) — VRAM ${vram} Mo [pas de temperature — installez nvidia-smi ou OHM]" -color (Get-StatusColor $st)
                 Add-Result "GPU: $($g.Name)" $st "VRAM ${vram} Mo" "Driver: $($g.DriverVersion) | Info driver seul" | Out-Null
             }
-        } catch {
+        }
+        catch {
+            Write-Verbose "Win32_VideoController : $($_.Exception.Message)"
             Add-Result 'GPU' 'N/A' 'Indisponible' $_.Exception.Message | Out-Null
         }
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 # TEST 7 — UPTIME & SYSTEME
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 function Invoke-UptimeTest {
     Write-Section "UPTIME & SYSTEME"
 
@@ -669,32 +1800,32 @@ function Invoke-UptimeTest {
     Write-Info "Uptime : ${days}j $($uptime.Hours)h $($uptime.Minutes)m" -color 'Gray'
 
     $stUptime = if ($days -lt $cfg.UptimeDaysWarn) { 'OK' } else { 'WARN' }
-    $stRAM    = if ($ramPct -lt $cfg.RamPctWarn) { 'OK' }
+    $stRAM    = if ($ramPct -lt $cfg.RamPctWarn)   { 'OK' }
                 elseif ($ramPct -lt $cfg.RamPctFail) { 'WARN' }
-                else { 'FAIL' }
+                else                                  { 'FAIL' }
 
     Add-Result 'Uptime'       $stUptime "${days}j $($uptime.Hours)h $($uptime.Minutes)m" "OS: $($os.Caption)" | Out-Null
-    Add-Result 'RAM utilisee' $stRAM    "${ramPct}%"                                      "Physique: ${ramGB} Go" | Out-Null
-    Add-Result 'CPU info'     'OK'      $cpu.Name                                         "Cores: $($cpu.NumberOfCores) / Logiques: $($cpu.NumberOfLogicalProcessors)" | Out-Null
+    Add-Result 'RAM utilisee' $stRAM    "${ramPct}%"  "Physique: ${ramGB} Go" | Out-Null
+    Add-Result 'CPU info'     'OK'      $cpu.Name     "Cores: $($cpu.NumberOfCores) / Logiques: $($cpu.NumberOfLogicalProcessors)" | Out-Null
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MOTEUR PRINCIPAL (unique, partagé CLI + GUI via runspace)
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
+# MOTEUR PRINCIPAL
+#─────────────────────────────────────────────────────────────────────────────
 function Invoke-AllTests {
     $results.Clear()
-    if (Set-Should-Run 'RAM')     { Invoke-RamTest    }
-    if (Set-Should-Run 'Latence') { Invoke-LatenceTest }
-    if (Set-Should-Run 'WHEA')    { Invoke-WheaTest   }
-    if (Set-Should-Run 'Temp')    { Invoke-TempTest   }
-    if (Set-Should-Run 'Disque')  { Invoke-DisqueTest }
-    if (Set-Should-Run 'GPU')     { Invoke-GpuTest    }
-    if (Set-Should-Run 'Uptime')  { Invoke-UptimeTest }
+    if (Set-ShouldRun 'RAM')     { Invoke-RamTest     }
+    if (Set-ShouldRun 'Latence') { Invoke-LatenceTest }
+    if (Set-ShouldRun 'WHEA')    { Invoke-WheaTest    }
+    if (Set-ShouldRun 'Temp')    { Invoke-TempTest    }
+    if (Set-ShouldRun 'Disque')  { Invoke-DisqueTest  }
+    if (Set-ShouldRun 'GPU')     { Invoke-GpuTest     }
+    if (Set-ShouldRun 'Uptime')  { Invoke-UptimeTest  }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 # HISTORIQUE JSON
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 $historyDir = Join-Path $env:APPDATA 'occt81\history'
 
 function Save-History {
@@ -714,19 +1845,22 @@ function Save-History {
         $payload | ConvertTo-Json -Depth 5 | Set-Content $outFile -Encoding UTF8
         if (-not $Silent) { Write-Info "Historique : $outFile" -color 'DarkGray' }
         return $outFile
-    } catch {
+    }
+    catch {
         if (-not $Silent) { Write-Info "! Historique non sauvegarde : $($_.Exception.Message)" -color 'DarkYellow' }
         return $null
     }
 }
 
-function Compare-History([string]$jsonPath) {
+function Compare-History {
+    param([string]$jsonPath)
+
     if (-not (Test-Path $jsonPath)) {
         Write-Info "! Fichier introuvable : $jsonPath" -color 'Red'
         return
     }
     try {
-        $prev    = Get-Content $jsonPath -Raw | ConvertFrom-Json
+        $prev     = Get-Content $jsonPath -Raw | ConvertFrom-Json
         $prevDate = if ($prev.Date) { $prev.Date } else { 'date inconnue' }
         Write-Header "COMPARAISON avec run du $prevDate — $($prev.Machine)"
 
@@ -744,148 +1878,579 @@ function Compare-History([string]$jsonPath) {
             if ($p.Status -ne $cur.Status) {
                 $changes++
                 $arrow = switch ($cur.Status) {
-                    'OK'   { '<-- AMELIORE' }
-                    'FAIL' { '<-- DEGRADE !!' }
+                    'OK'    { '<-- AMELIORE' }
+                    'FAIL'  { '<-- DEGRADE !!' }
                     default { '<-- change' }
                 }
                 $col = switch ($cur.Status) {
-                    'OK'   { 'Green' }
-                    'FAIL' { 'Red' }
+                    'OK'    { 'Green' }
+                    'FAIL'  { 'Red' }
                     default { 'Yellow' }
                 }
                 Write-Info "$($cur.Test) : $($p.Status) -> $($cur.Status)  $arrow" -color $col
             }
         }
         if ($changes -eq 0) { Write-Info 'Aucun changement de statut detecte.' -color 'Green' }
-    } catch {
+    }
+    catch {
         Write-Info "! Erreur comparaison : $($_.Exception.Message)" -color 'Red'
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# EXPORT (TXT / CSV / HTML)
-# ─────────────────────────────────────────────────────────────────────────────
-function Export-Report {
-    if (-not $Export) { return }
-    $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Export)
-    $ext = [System.IO.Path]::GetExtension($resolvedPath).ToLower()
-
-    switch ($ext) {
-        '.csv' {
-            $results | Select-Object Heure,Test,Status,Valeur,Detail |
-                Export-Csv -Path $resolvedPath -NoTypeInformation -Encoding UTF8
+#─────────────────────────────────────────────────────────────────────────────
+# UPLOADS
+#─────────────────────────────────────────────────────────────────────────────
+function Invoke-DPasteUpload {
+    param([string]$Text, [string]$Title = "occt81 Report")
+    try {
+        $body = @{
+            content     = $Text
+            title       = $Title
+            syntax      = 'powershell'
+            expiry_days = 30
         }
-        '.html' {
-            $osH   = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-            $cpuH  = Get-CimInstance Win32_Processor       -ErrorAction SilentlyContinue | Select-Object -First 1
-            $upH   = if ($osH) { (Get-Date) - $osH.LastBootUpTime } else { $null }
-            $dispOS  = if ($osH)  { $osH.Caption } else { 'Inconnu' }
-            $dispCPU = if ($cpuH) { $cpuH.Name   } else { 'Inconnu' }
-            $dispUp  = if ($upH)  { "$([Math]::Floor($upH.TotalDays))j $($upH.Hours)h $($upH.Minutes)m" } else { 'N/A' }
-
-            $rows = @($results | ForEach-Object {
-                $bg  = switch ($_.Status) { 'OK'{'#0a1628'} 'WARN'{'#1e1b16'} 'FAIL'{'#1c1917'} default{'#0a1628'} }
-                $col = switch ($_.Status) { 'OK'{'#4ade80'} 'WARN'{'#fbbf24'} 'FAIL'{'#f87171'} default{'#94a3b8'} }
-                "<tr style='background:$bg'><td style='color:#64748b'>$($_.Heure)</td><td style='color:#e2e8f0'>$($_.Test)</td><td style='color:$col;font-weight:bold'>$($_.Status)</td><td style='color:#e2e8f0'>$($_.Valeur)</td><td style='color:#475569;font-size:12px'>$($_.Detail)</td></tr>"
-            })
-
-            $crit  = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
-            $warns = @($results | Where-Object { $_.Status -eq 'WARN' }).Count
-            $concl = if ($crit -gt 0) { '&#9940; Probleme materiel detecte' }
-                     elseif ($warns -gt 0) { '&#9888; Avertissements' }
-                     else { '&#9989; Systeme stable' }
-            $cCol  = if ($crit -gt 0) { '#f87171' } elseif ($warns -gt 0) { '#fbbf24' } else { '#4ade80' }
-
-            $html = @"
-<!DOCTYPE html><html lang="fr"><head><meta charset="UTF-8"><title>occt81 v3.0</title>
-<style>
-body{font-family:Consolas,monospace;background:#020617;color:#e2e8f0;margin:0;padding:32px}
-h1{color:#38bdf8;font-size:22px;letter-spacing:1px;margin-bottom:4px}
-.meta{color:#94a3b8;font-size:13px;margin-bottom:24px;line-height:1.8;border-left:3px solid #1e293b;padding-left:15px}
-table{width:100%;border-collapse:collapse;font-size:13px;border:1px solid #1e293b}
-th{background:#050d1a;color:#475569;padding:12px 14px;text-align:left;font-weight:bold;border-bottom:1px solid #1e293b}
-td{padding:10px 14px;border-bottom:1px solid #0a1628}
-.concl{margin-top:24px;padding:16px 20px;border-radius:4px;background:#0a1628;border:1px solid #1e293b;font-size:15px;color:$cCol;font-weight:bold}
-.foot{margin-top:12px;color:#1e293b;font-size:11px}
-</style></head><body>
-<h1>&#9881; occt81 v3.0</h1>
-<div class="meta">
-<strong>Machine :</strong> $env:COMPUTERNAME<br>
-<strong>Systeme :</strong> $dispOS<br>
-<strong>CPU :</strong> $dispCPU<br>
-<strong>Uptime :</strong> $dispUp<br>
-<strong>Date :</strong> $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')
-</div>
-<table>
-<tr><th>HEURE</th><th>TEST</th><th>STATUT</th><th>VALEUR</th><th>DETAIL</th></tr>
-$($rows -join "`n")
-</table>
-<div class="concl">$concl</div>
-<div class="foot">Genere par occt81 v3.0 — github.com/ps81frt/occt81</div>
-</body></html>
-"@
-            [System.IO.File]::WriteAllText($resolvedPath, $html, [System.Text.Encoding]::UTF8)
-        }
-        default {
-            $osH  = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-            $cpuH = Get-CimInstance Win32_Processor       -ErrorAction SilentlyContinue | Select-Object -First 1
-            $upH  = if ($osH) { (Get-Date) - $osH.LastBootUpTime } else { $null }
-            $lines = @(
-                "occt81 v3.0 — $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')",
-                "Machine : $env:COMPUTERNAME",
-                "Systeme : $(if($osH){$osH.Caption}else{'Inconnu'})",
-                "CPU     : $(if($cpuH){$cpuH.Name}else{'Inconnu'})",
-                "Uptime  : $(if($upH){"$([Math]::Floor($upH.TotalDays))j $($upH.Hours)h $($upH.Minutes)m"}else{'N/A'})",
-                ('-' * 90)
-            )
-            foreach ($r in $results) {
-                $lines += "{0,-32} [{1,-4}] {2,-22} {3}" -f $r.Test, $r.Status, $r.Valeur, $r.Detail
-            }
-            $lines | Set-Content -Path $resolvedPath -Encoding UTF8
-        }
+        $res = Invoke-RestMethod -Uri "https://dpaste.com/api/v2/" -Method Post -Body $body -ErrorAction Stop
+        Write-Host "DPaste : $($res.ToString().Trim())" -ForegroundColor Cyan
+        return $res.ToString().Trim()
     }
-    if (-not $Silent) { Write-Info "Export : $resolvedPath" -color 'Green' }
+    catch {
+        Write-Warning "DPaste upload echoue : $($_.Exception.Message)"
+        return $null
+    }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+function Invoke-GoFileUpload {
+    param([string]$FilePath)
+    try {
+        if (-not (Test-Path $FilePath)) { throw "Fichier introuvable : $FilePath" }
+
+        # Utiliser Invoke-RestMethod au lieu de curl.exe (natif PS 5.1+)
+        $serverJson = Invoke-RestMethod -Uri "https://api.gofile.io/servers" -ErrorAction Stop
+        if ($serverJson.status -ne "ok") { throw "API GoFile erreur : $($serverJson.status)" }
+        $server = $serverJson.data.servers | Get-Random | Select-Object -ExpandProperty name
+
+        Write-Host "Upload GoFile (serveur: $server)..." -ForegroundColor Cyan -NoNewline
+
+        # Multipart form-data avec Invoke-RestMethod
+        $boundary = [System.Guid]::NewGuid().ToString()
+        $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
+        $fileName  = [System.IO.Path]::GetFileName($FilePath)
+        $encoding  = [System.Text.Encoding]::UTF8
+
+        $bodyParts  = "--$boundary`r`n"
+        $bodyParts += "Content-Disposition: form-data; name=`"file`"; filename=`"$fileName`"`r`n"
+        $bodyParts += "Content-Type: application/octet-stream`r`n`r`n"
+        $bodyBytes  = $encoding.GetBytes($bodyParts) + $fileBytes + $encoding.GetBytes("`r`n--$boundary--`r`n")
+
+        $uploadJson = Invoke-RestMethod -Uri "https://$server.gofile.io/contents/uploadfile" `
+                        -Method Post `
+                        -ContentType "multipart/form-data; boundary=$boundary" `
+                        -Body $bodyBytes `
+                        -ErrorAction Stop
+
+        if ($uploadJson.status -eq "ok" -and $uploadJson.data) {
+            $dl = if ($uploadJson.data.downloadPage)  { $uploadJson.data.downloadPage }
+                  elseif ($uploadJson.data.code)       { "https://gofile.io/d/$($uploadJson.data.code)" }
+                  elseif ($uploadJson.data.fileId)     { "https://gofile.io/d/$($uploadJson.data.fileId)" }
+                  else { throw "Champ de lien introuvable dans la reponse" }
+            Write-Host " OK" -ForegroundColor Green
+            Write-Host "   LIEN GOFILE : $dl" -ForegroundColor Yellow
+            return $dl
+        }
+        else {
+            throw "Upload echoue : $($uploadJson.status)"
+        }
+    }
+    catch {
+        Write-Warning "GoFile upload echoue : $($_.Exception.Message)"
+        return $null
+    }
+}
+
+#─────────────────────────────────────────────────────────────────────────────
+# CONCLUSION PARTAGEE (unique source de verite — CLI + export)
+#─────────────────────────────────────────────────────────────────────────────
+function Get-DiagConclusion {
+    $critical  = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
+    $warns     = @($results | Where-Object { $_.Status -eq 'WARN' }).Count
+    $failItems = @($results | Where-Object { $_.Status -eq 'FAIL' })
+
+    $lines = @()
+    if ($critical -gt 0) {
+        $smartFail = $failItems | Where-Object { $_.Test -match 'SMART' }
+        if ($smartFail) {
+            $lines += " !! DISQUE EN DANGER — sauvegarde URGENTE recommandee"
+            foreach ($f in $smartFail) {
+                $dev    = ($f.Test -replace 'SMART:\s*', '').Trim()
+                $detail = "$($f.Valeur) $($f.Detail)"
+                $lines += "   Disque : $dev"
+                $lines += "   Details: $detail"
+                if ($detail -match 'Pending:\s*(\d+)') {
+                    $p = [int]$Matches[1]
+                    if ($p -gt 100) { $lines += "   Cause: secteurs instables critiques ($p)" }
+                    elseif ($p -gt 0) { $lines += "   Cause: secteurs instables ($p)" }
+                }
+                if ($detail -match 'Uncorrectable:\s*(\d+)') {
+                    $u = [int]$Matches[1]
+                    if ($u -gt 0) { $lines += "   Cause: erreurs non recuperables ($u)" }
+                }
+            }
+        }
+        elseif ($failItems | Where-Object { $_.Test -match '^RAM' }) {
+            $lines += " !! ERREURS RAM detectees — verifier la memoire"
+            foreach ($f in ($failItems | Where-Object { $_.Test -match '^RAM' })) {
+                $lines += "   Details: $($f.Valeur)"
+            }
+        }
+        elseif ($failItems | Where-Object { $_.Test -match 'WHEA' }) {
+            $lines += " !! ERREURS MATERIELLES CPU/PCIe (WHEA)"
+            foreach ($f in ($failItems | Where-Object { $_.Test -match 'WHEA' })) {
+                $lines += "   Details: $($f.Valeur)"
+            }
+        }
+        else {
+            $lines += " !! PROBLEME MATERIEL detecte"
+            foreach ($f in $failItems) { $lines += "   $($f.Test.TrimEnd()) -> $($f.Valeur.TrimEnd())" }
+        }
+    }
+    elseif ($warns -gt 0) {
+        $lines += " !! AVERTISSEMENTS — surveillance recommandee"
+    }
+    else {
+        $lines += " Systeme stable — aucun probleme detecte"
+    }
+
+    return @{
+        Lines    = $lines
+        Critical = $critical
+        Warns    = $warns
+    }
+}
+
+#─────────────────────────────────────────────────────────────────────────────
 # RESUME CLI
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
 function Write-Summary {
-    Write-Header 'RESUME'
+    Write-Header 'RESUME DIAGNOSTIQUE'
+
+    # ── Tableau principal ────────────────────────────────────────────────────
+    Write-Host ""
+    Write-Host ("  {0,-32} {1,-8} {2,-22} {3}" -f 'TEST', 'STATUT', 'VALEUR', 'DETAIL') -ForegroundColor DarkGray
+    Write-Host ("  {0}" -f ('-' * 90)) -ForegroundColor DarkGray
+
     foreach ($r in $results) {
         $color  = Get-StatusColor $r.Status
-        $name   = $r.Test.PadRight(30)
-        $status = "[$($r.Status.PadRight(4))]"
-        $val    = $r.Valeur.PadRight(20)
-        Write-Host "  $name $status $val $($r.Detail)" -ForegroundColor $color
+        $icon   = switch ($r.Status) { 'OK'{'  '} 'WARN'{'!!'} 'FAIL'{'XX'} default{'  '} }
+        $name   = $r.Test.TrimEnd().PadRight(32)
+        $status = ("[{0}]" -f $r.Status.PadRight(4)).PadRight(8)
+        $val    = $r.Valeur.TrimEnd().PadRight(22)
+        $detail = $r.Detail.TrimEnd()
+
+        # Tronquer le detail si trop long (le résumé complet est dans l'export)
+        if ($detail.Length -gt 80) { $detail = $detail.Substring(0, 77) + '...' }
+
+        Write-Host ("  $icon $name $status $val $detail") -ForegroundColor $color
     }
 
-    $bar      = '=' * 58
-    $critical = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
-    $warns    = @($results | Where-Object { $_.Status -eq 'WARN' }).Count
+    Write-Host ("  {0}" -f ('-' * 90)) -ForegroundColor DarkGray
 
-    Write-Host "`n  $bar" -ForegroundColor DarkCyan
-    if ($critical -gt 0) {
-        Write-Host "  !! PROBLEME MATERIEL — verifiez RAM et journaux WHEA" -ForegroundColor Red
-    } elseif ($warns -gt 0) {
-        Write-Host "  !! AVERTISSEMENTS — surveillance recommandee" -ForegroundColor Yellow
-    } else {
-        Write-Host "  Systeme stable — aucun probleme detecte" -ForegroundColor Green
+    # ── Legende statuts ──────────────────────────────────────────────────────
+    Write-Host ""
+    Write-Host "  LEGENDE STATUTS :" -ForegroundColor DarkGray
+    Write-Host "    [OK  ]  Tout va bien, dans les seuils normaux"                          -ForegroundColor Green
+    Write-Host "    [WARN]  Valeur hors seuil — a surveiller mais pas critique"             -ForegroundColor Yellow
+    Write-Host "    [FAIL]  Probleme detecte — intervention recommandee"                    -ForegroundColor Red
+    Write-Host "    [N/A ]  Test impossible (droits insuffisants ou outil manquant)"        -ForegroundColor DarkGray
+
+    # ── Legende par test ─────────────────────────────────────────────────────
+    Write-Host ""
+    Write-Host "  LEGENDE PAR TEST :" -ForegroundColor DarkGray
+    $testLegend = @(
+        @{ Test='RAM';                    Desc='Erreurs de bits detectees dans la RAM physique (patterns fill+verify+walking)' }
+        @{ Test='CPU Scheduling (moy)';   Desc='Temps moyen par iteration — reflete la frequence CPU effective' }
+        @{ Test='CPU Scheduling (jitter)';Desc='Jitter = P99/Min — irregularite du scheduling Windows (1x=parfait, >3x=warn, >8x=fail)' }
+        @{ Test='WHEA total';             Desc='Erreurs hardware signalees par le firmware/CPU (0 = normal)' }
+        @{ Test='WHEA critique';          Desc='Sous-ensemble WHEA critique — zero tolerance (crash potentiel)' }
+        @{ Test='Temp CPU';               Desc='Temperature CPU en charge — au-dela de 85C = risque de throttling' }
+        @{ Test='Temp GPU';               Desc='Temperature GPU — au-dela de 90C = risque de throttling' }
+        @{ Test='Disque';                 Desc='SMART + vitesse I/O sequentielle (lecture/ecriture en Mo/s)' }
+        @{ Test='GPU';                    Desc='Presence et charge GPU detectees via nvidia-smi / OHM / WMI' }
+        @{ Test='Uptime';                 Desc='Temps depuis le dernier redemarrage (>30j = WARN)' }
+    )
+    foreach ($tl in $testLegend) {
+        Write-Host ("    {0,-30} : {1}" -f $tl.Test, $tl.Desc) -ForegroundColor DarkGray
     }
-    Write-Host "  $bar`n" -ForegroundColor DarkCyan
+
+    # ── Conclusion ───────────────────────────────────────────────────────────
+    $bar  = '=' * 58
+    $conc = Get-DiagConclusion
+
+    Write-Host ""
+    Write-Host "$bar" -ForegroundColor DarkCyan
+    foreach ($line in $conc.Lines) {
+        $col = if ($conc.Critical -gt 0) { 'Red' } elseif ($conc.Warns -gt 0) { 'Yellow' } else { 'Green' }
+        Write-Host $line -ForegroundColor $col
+    }
+    Write-Host "$bar`n" -ForegroundColor DarkCyan
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
+#─────────────────────────────────────────────────────────────────────────────
+# EXPORT (TXT / CSV / HTML / JSON)
+#─────────────────────────────────────────────────────────────────────────────
+function Export-Report {
+    # Preparer le fichier upload TXT si necessaire
+    $uploadFile   = $null
+    $isTempUpload = $false
+
+    if ($UploadDPaste -or $UploadGoFile) {
+        if ($Export -ne '' -and [System.IO.Path]::GetExtension($Export).ToLower() -eq '.txt') {
+            $uploadFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Export)
+        }
+        if (-not $uploadFile) {
+            $uploadFile   = "$env:TEMP\occt81_upload_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+            $isTempUpload = $true
+        }
+    }
+
+    if ($Export -eq '' -and -not ($UploadDPaste -or $UploadGoFile)) { return }
+
+    $resolvedPath = $null
+    $ext          = '.txt'
+
+    if ($Export -ne '') {
+        $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Export)
+        $ext          = [System.IO.Path]::GetExtension($resolvedPath).ToLower()
+    }
+    elseif ($isTempUpload) {
+        $resolvedPath = $uploadFile
+    }
+
+    # Infos systeme pour les rapports
+    $osH    = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $cpuH   = Get-CimInstance Win32_Processor       -ErrorAction SilentlyContinue | Select-Object -First 1
+    $upH    = if ($osH) { (Get-Date) - $osH.LastBootUpTime } else { $null }
+    $dispOS  = if ($osH)  { $osH.Caption } else { 'Inconnu' }
+    $dispCPU = if ($cpuH) { $cpuH.Name   } else { 'Inconnu' }
+    $dispUp  = if ($upH)  { "$([Math]::Floor($upH.TotalDays))j $($upH.Hours)h $($upH.Minutes)m" } else { 'N/A' }
+
+    $conc        = Get-DiagConclusion
+    $contentTxt  = ''
+
+    function Build-TextContent {
+        $header = @(
+            "occt81 v4.2 — $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')",
+            "Machine : $env:COMPUTERNAME",
+            "Systeme : $dispOS",
+            "CPU     : $dispCPU",
+            "Uptime  : $dispUp"
+        )
+        $bar   = '=' * 90
+        $sep   = '-' * 90
+        $lines = @(
+            $bar,
+            "  RESUME DIAGNOSTIQUE",
+            $bar,
+            ("  {0,-30} {1,-8} {2,-22} {3}" -f 'TEST','STATUT','VALEUR','DETAIL'),
+            $sep
+        )
+        foreach ($r in $results) {
+            $icon = switch ($r.Status) { 'OK'{'  '} 'WARN'{'!!'} 'FAIL'{'XX'} default{'  '} }
+            $n = $r.Test.TrimEnd().PadRight(30)
+            $s = ("[{0}]" -f $r.Status.PadRight(4)).PadRight(8)
+            $v = $r.Valeur.TrimEnd().PadRight(22)
+            $lines += "  $icon $n $s $v $($r.Detail.TrimEnd())"
+        }
+        $lines += $sep
+        $lines += $conc.Lines
+        $lines += $bar
+        $lines += ""
+        $lines += "  LEGENDE STATUTS :"
+        $lines += "    [OK  ]  Dans les seuils normaux"
+        $lines += "    [WARN]  A surveiller — pas critique"
+        $lines += "    [FAIL]  Probleme detecte — intervention recommandee"
+        $lines += "    [N/A ]  Test impossible (droits insuffisants ou outil manquant)"
+        $lines += ""
+        $lines += "  LEGENDE TESTS :"
+        $lines += "    RAM                       : Erreurs de bits RAM (fill+verify+walking). 0 = normal."
+        $lines += "    CPU Scheduling (moy)      : Temps moyen/iteration = frequence CPU effective (pas latence hardware)"
+        $lines += "    CPU Scheduling (jitter)   : Jitter = P99/Min. 1x=parfait, <3x=OK, 3-8x=WARN, >8x=FAIL"
+        $lines += "    WHEA total                : Erreurs hardware CPU/firmware. >0 = investigation recommandee"
+        $lines += "    WHEA critique             : Severite critique WHEA. Zero tolerance."
+        $lines += "    Temp CPU                  : Temperature CPU sous charge. Seuil WARN=85C"
+        $lines += "    Temp GPU                  : Temperature GPU. Seuil WARN=90C"
+        $lines += "    Disque                    : SMART + vitesse sequentielle I/O (Mo/s)"
+        $lines += "    GPU                       : Presence/charge GPU (nvidia-smi / OHM / WMI)"
+        $lines += "    Uptime                    : Duree depuis dernier redemarrage. >30j = WARN"
+        $lines += $bar
+        return ($header + $lines) -join "`n"
+    }
+
+    if ($ext -eq '.csv') {
+        # CSV enrichi : metadata en tete + donnees + legende en pied
+        # UTF-8 BOM pour compatibilite Excel (evite les problemes d accents)
+        $csvLines = @()
+
+        # En-tete metadata (lignes commentees, ignorees par les parseurs standard)
+        $csvLines += "# occt81 v4.2 — Rapport de diagnostic"
+        $csvLines += "# Date,$( Get-Date -Format 'dd/MM/yyyy HH:mm:ss')"
+        $csvLines += "# Machine,$env:COMPUTERNAME"
+        $csvLines += "# Systeme,$dispOS"
+        $csvLines += "# CPU,$dispCPU"
+        $csvLines += "# Uptime,$dispUp"
+        $csvLines += "# Conclusion,$($conc.Lines -join ' | ')"
+        $csvLines += ""
+
+        # Donnees principales
+        $csvLines += '"HEURE","TEST","STATUT","VALEUR","DETAIL"'
+        foreach ($r in $results) {
+            $h = $r.Heure  -replace '"','""'
+            $t = $r.Test.TrimEnd()   -replace '"','""'
+            $s = $r.Status -replace '"','""'
+            $v = $r.Valeur.TrimEnd() -replace '"','""'
+            $d = $r.Detail.TrimEnd() -replace '"','""'
+            $csvLines += "`"$h`",`"$t`",`"$s`",`"$v`",`"$d`""
+        }
+        $csvLines += ""
+
+        # Legende en pied
+        $csvLines += "# --- LEGENDE STATUTS ---"
+        $csvLines += "# OK,Dans les seuils normaux"
+        $csvLines += "# WARN,A surveiller — pas critique"
+        $csvLines += "# FAIL,Probleme detecte — intervention recommandee"
+        $csvLines += "# N/A,Test impossible (droits insuffisants ou outil manquant)"
+        $csvLines += ""
+        $csvLines += "# --- LEGENDE TESTS ---"
+        $csvLines += "# RAM,Erreurs de bits RAM (fill+verify+walking). 0 = normal."
+        $csvLines += "# CPU Scheduling (moy),Temps moyen/iteration — frequence CPU effective (pas latence hardware)"
+        $csvLines += "# CPU Scheduling (jitter),Jitter = P99/Min. 1x=parfait | <3x=OK | 3-8x=WARN | >8x=FAIL"
+        $csvLines += "# WHEA total,Erreurs hardware CPU/firmware. >0 = investigation recommandee"
+        $csvLines += "# WHEA critique,Severite critique WHEA. Zero tolerance."
+        $csvLines += "# Temp CPU,Temperature CPU sous charge. Seuil WARN=85C"
+        $csvLines += "# Temp GPU,Temperature GPU. Seuil WARN=90C"
+        $csvLines += "# Disque,SMART + vitesse sequentielle I/O (Mo/s)"
+        $csvLines += "# GPU,Presence/charge GPU (nvidia-smi / OHM / WMI)"
+        $csvLines += "# Uptime,Duree depuis dernier redemarrage. >30j = WARN"
+
+        # UTF-8 BOM + ecriture
+        $bom     = [System.Text.Encoding]::UTF8.GetPreamble()
+        $content = $csvLines -join "`r`n"
+        $bytes   = $bom + [System.Text.Encoding]::UTF8.GetBytes($content)
+        [System.IO.File]::WriteAllBytes($resolvedPath, $bytes)
+
+        if ($isTempUpload) {
+            $contentTxt = Build-TextContent
+            [System.IO.File]::WriteAllText($uploadFile, $contentTxt, [System.Text.Encoding]::UTF8)
+        }
+    }
+    elseif ($ext -eq '.html') {
+        $rows = @($results | ForEach-Object {
+            $bg  = switch ($_.Status) { 'OK'{'#0a1628'} 'WARN'{'#1e1b16'} 'FAIL'{'#1c1917'} default{'#0a1628'} }
+            $cls = switch ($_.Status) { 'OK'{'ok'} 'WARN'{'warn'} 'FAIL'{'fail'} default{'na'} }
+            $icon = switch ($_.Status) { 'OK'{'✓'} 'WARN'{'⚠'} 'FAIL'{'✗'} default{'—'} }
+            # Tooltip : detail complet au survol
+            $tipDetail = [System.Web.HttpUtility]::HtmlEncode($_.Detail.TrimEnd())
+            # Formater le detail en badges cle=valeur lisibles
+            $detailRaw = $_.Detail.TrimEnd()
+            $detailHtml = if ($detailRaw -match '\w+=\S+') {
+                $tokens = $detailRaw -split '\s*\|\s*'
+                $parts  = @()
+                foreach ($tok in $tokens) {
+                    $subtoks = $tok.Trim() -split '\s+'
+                    foreach ($s in $subtoks) {
+                        if ($s -match '^([\w][\w ]+)=(.+)$') {
+                            $parts += "<span class='badge'><b>$([System.Web.HttpUtility]::HtmlEncode($Matches[1]))</b>&thinsp;$([System.Web.HttpUtility]::HtmlEncode($Matches[2]))</span>"
+                        } elseif ($s.Trim() -ne '') {
+                            $parts += "<span class='badge-plain'>$([System.Web.HttpUtility]::HtmlEncode($s.Trim()))</span>"
+                        }
+                    }
+                }
+                $parts -join ' '
+            } else {
+                [System.Web.HttpUtility]::HtmlEncode($detailRaw)
+            }
+            "<tr style='background:$bg' title='$tipDetail'><td style='color:#64748b;white-space:nowrap'>$($_.Heure)</td><td style='color:#e2e8f0;white-space:nowrap'>$($_.Test.TrimEnd())</td><td class='$cls' style='text-align:center;white-space:nowrap'>$icon $($_.Status)</td><td style='color:#e2e8f0;white-space:nowrap'>$($_.Valeur.TrimEnd())</td><td class='detail-cell'>$detailHtml</td></tr>"
+        })
+        $conclusionHtml = ($conc.Lines | ForEach-Object {
+            $_ -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
+        }) -join '<br>'
+        $cCol  = if ($conc.Critical -gt 0) { '#f87171' } elseif ($conc.Warns -gt 0) { '#fbbf24' } else { '#4ade80' }
+
+        $html = @"
+<!DOCTYPE html><html lang='fr'><head><meta charset='UTF-8'><title>occt81 Report — $env:COMPUTERNAME</title>
+<style>
+*{box-sizing:border-box}
+body{font-family:Consolas,monospace;background:#020617;color:#e2e8f0;margin:0;padding:32px;font-size:13px}
+h1{color:#38bdf8;font-size:22px;letter-spacing:1px;margin-bottom:4px}
+.meta{color:#94a3b8;font-size:13px;margin-bottom:24px;line-height:1.8;border-left:3px solid #1e293b;padding-left:15px}
+table{width:100%;border-collapse:collapse;font-size:13px;border:1px solid #1e293b;margin-bottom:16px}
+th{background:#050d1a;color:#64748b;padding:10px 14px;text-align:left;font-weight:bold;border-bottom:2px solid #1e293b;white-space:nowrap}
+td{padding:9px 14px;border-bottom:1px solid #0a1628;vertical-align:middle}
+tr:hover td{background:#0f172a}
+.ok{color:#4ade80;font-weight:bold}.warn{color:#fbbf24;font-weight:bold}.fail{color:#f87171;font-weight:bold}.na{color:#64748b}
+.concl{margin-top:24px;padding:16px 20px;border-radius:4px;background:#0a1628;border:1px solid #1e293b;font-size:15px;color:$cCol;font-weight:bold;line-height:1.6}
+.legend{margin-top:24px;padding:16px 20px;background:#050d1a;border:1px solid #1e293b;border-radius:4px}
+.legend h2{color:#38bdf8;font-size:14px;margin:0 0 12px 0;letter-spacing:1px}
+.legend-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:6px 24px}
+.legend-item{color:#64748b;font-size:12px;line-height:1.6}
+.legend-item b{color:#94a3b8}
+.legend-status{margin-top:16px;display:flex;gap:24px;flex-wrap:wrap}
+.ls{font-size:12px}.ls .ok{color:#4ade80}.ls .warn{color:#fbbf24}.ls .fail{color:#f87171}.ls .na{color:#64748b}
+.foot{margin-top:12px;color:#334155;font-size:11px}
+.detail-cell{font-size:11px;color:#475569;line-height:1.8;max-width:500px}
+.badge{display:inline-block;background:#0f172a;border:1px solid #1e293b;border-radius:3px;padding:1px 6px;margin:1px 2px;white-space:nowrap;font-size:11px}
+.badge b{color:#94a3b8;margin-right:2px}
+.badge-plain{display:inline-block;color:#475569;font-size:11px;padding:1px 3px}
+</style></head><body>
+<h1>⚙ occt81 v4.2 — Rapport de diagnostic</h1>
+<div class='meta'>
+<b>Machine</b> : $env:COMPUTERNAME &nbsp;|&nbsp;
+<b>Systeme</b> : $dispOS &nbsp;|&nbsp;
+<b>CPU</b> : $dispCPU<br>
+<b>Uptime</b> : $dispUp &nbsp;|&nbsp;
+<b>Date</b> : $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')
+</div>
+
+<table>
+<thead><tr>
+  <th>HEURE</th>
+  <th>TEST</th>
+  <th style='text-align:center'>STATUT</th>
+  <th>VALEUR</th>
+  <th>DETAIL <span style='font-weight:normal;color:#334155'>(survoler pour voir le detail complet)</span></th>
+</tr></thead>
+<tbody>
+$($rows -join "`n")
+</tbody></table>
+
+<div class='concl'>$conclusionHtml</div>
+
+<div class='legend'>
+  <h2>LEGENDE DES TESTS</h2>
+  <div class='legend-grid'>
+    <div class='legend-item'><b>RAM</b> — Erreurs de bits dans la RAM physique (patterns fill+verify+walking bits). 0 erreur = normal.</div>
+    <div class='legend-item'><b>CPU Scheduling (moy)</b> — Temps moyen par iteration. Reflete la frequence CPU effective, pas la latence hardware.</div>
+    <div class='legend-item'><b>CPU Scheduling (jitter)</b> — Irregularite du scheduling Windows. Jitter = P99/Min. 1x=parfait · &lt;3x=OK · 3-8x=WARN · &gt;8x=FAIL</div>
+    <div class='legend-item'><b>WHEA total</b> — Erreurs hardware signalees par CPU/firmware. Toute valeur &gt;0 merite investigation.</div>
+    <div class='legend-item'><b>WHEA critique</b> — Sous-ensemble WHEA de severite critique. Zero tolerance — peut causer des crashs.</div>
+    <div class='legend-item'><b>Temp CPU</b> — Temperature CPU sous charge. Seuil WARN : 85°C (throttling probable au-dela).</div>
+    <div class='legend-item'><b>Temp GPU</b> — Temperature GPU. Seuil WARN : 90°C.</div>
+    <div class='legend-item'><b>Disque</b> — Sante SMART + vitesse sequentielle (Mo/s). SMART KO = risque de perte de donnees.</div>
+    <div class='legend-item'><b>GPU</b> — Presence et utilisation GPU (nvidia-smi / OHM / WMI).</div>
+    <div class='legend-item'><b>Uptime</b> — Duree depuis le dernier redemarrage. &gt;30 jours = WARN (mises a jour en attente ?).</div>
+  </div>
+  <div class='legend-status'>
+    <div class='ls'><span class='ok'>✓ OK</span> — Dans les seuils normaux</div>
+    <div class='ls'><span class='warn'>⚠ WARN</span> — A surveiller, pas critique</div>
+    <div class='ls'><span class='fail'>✗ FAIL</span> — Probleme detecte, intervention recommandee</div>
+    <div class='ls'><span class='na'>— N/A</span> — Test impossible (droits ou outil manquant)</div>
+  </div>
+</div>
+
+<p class='foot'>Genere par occt81 v4.2 — $env:COMPUTERNAME — $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')</p>
+</body></html>
+"@
+        [System.IO.File]::WriteAllText($resolvedPath, $html, [System.Text.Encoding]::UTF8)
+        if ($isTempUpload) {
+            $contentTxt = Build-TextContent
+            [System.IO.File]::WriteAllText($uploadFile, $contentTxt, [System.Text.Encoding]::UTF8)
+        }
+    }
+    elseif ($ext -eq '.json') {
+        # JSON enrichi : metadata complete + conclusion + legende integrée
+        $legendeTests = @(
+            @{ Test='RAM';                     Description='Erreurs de bits RAM (fill+verify+walking). 0 = normal.' }
+            @{ Test='CPU Scheduling (moy)';    Description='Temps moyen/iteration — frequence CPU effective (pas latence hardware)' }
+            @{ Test='CPU Scheduling (jitter)'; Description='Jitter = P99/Min. 1x=parfait, <3x=OK, 3-8x=WARN, >8x=FAIL' }
+            @{ Test='WHEA total';              Description='Erreurs hardware CPU/firmware. >0 = investigation recommandee' }
+            @{ Test='WHEA critique';           Description='Severite critique WHEA. Zero tolerance.' }
+            @{ Test='Temp CPU';                Description='Temperature CPU sous charge. Seuil WARN=85C' }
+            @{ Test='Temp GPU';                Description='Temperature GPU. Seuil WARN=90C' }
+            @{ Test='Disque';                  Description='SMART + vitesse sequentielle I/O (Mo/s)' }
+            @{ Test='GPU';                     Description='Presence/charge GPU (nvidia-smi / OHM / WMI)' }
+            @{ Test='Uptime';                  Description='Duree depuis dernier redemarrage. >30j = WARN' }
+        )
+        $legendeStatuts = @(
+            @{ Statut='OK';   Signification='Dans les seuils normaux' }
+            @{ Statut='WARN'; Signification='A surveiller — pas critique' }
+            @{ Statut='FAIL'; Signification='Probleme detecte — intervention recommandee' }
+            @{ Statut='N/A';  Signification='Test impossible (droits insuffisants ou outil manquant)' }
+        )
+        $payload2 = [ordered]@{
+            _outil     = 'occt81 v4.2'
+            Date       = (Get-Date -Format 'o')
+            DateFr     = (Get-Date -Format 'dd/MM/yyyy HH:mm:ss')
+            Machine    = $env:COMPUTERNAME
+            Systeme    = $dispOS
+            CPU        = $dispCPU
+            Uptime     = $dispUp
+            Conclusion = [ordered]@{
+                Statut   = if ($conc.Critical -gt 0) { 'FAIL' } elseif ($conc.Warns -gt 0) { 'WARN' } else { 'OK' }
+                Critical = $conc.Critical
+                Warns    = $conc.Warns
+                Resume   = $conc.Lines -join ' | '
+            }
+            Results    = @($results | ForEach-Object {
+                [ordered]@{
+                    Heure  = $_.Heure
+                    Test   = $_.Test.TrimEnd()
+                    Status = $_.Status
+                    Valeur = $_.Valeur.TrimEnd()
+                    Detail = $_.Detail.TrimEnd()
+                }
+            })
+            Legende    = [ordered]@{
+                Statuts = $legendeStatuts
+                Tests   = $legendeTests
+            }
+        }
+        $payload2 | ConvertTo-Json -Depth 6 | Set-Content $resolvedPath -Encoding UTF8
+        if ($isTempUpload) {
+            $contentTxt = Build-TextContent
+            [System.IO.File]::WriteAllText($uploadFile, $contentTxt, [System.Text.Encoding]::UTF8)
+        }
+    }
+    else {
+        # .txt (defaut)
+        $contentTxt = Build-TextContent
+        [System.IO.File]::WriteAllText($resolvedPath, $contentTxt, [System.Text.Encoding]::UTF8)
+    }
+
+    if (-not $Silent) { Write-Info "Export : $resolvedPath" -color 'Green' }
+
+    # Uploads
+    if ($UploadDPaste -or $UploadGoFile) {
+        if (-not (Test-Path $uploadFile)) {
+            Write-Warning "Fichier upload introuvable : $uploadFile"
+        }
+        else {
+            Write-Info "Upload en cours ($([System.IO.Path]::GetFileName($uploadFile)))..." -color 'Cyan'
+            if ($UploadDPaste) {
+                if ($contentTxt -eq '') { $contentTxt = Get-Content $uploadFile -Raw }
+                Invoke-DPasteUpload -Text $contentTxt -Title "occt81_$env:COMPUTERNAME"
+            }
+            if ($UploadGoFile) {
+                Invoke-GoFileUpload -FilePath $uploadFile
+            }
+            if ($isTempUpload -and (Test-Path $uploadFile)) {
+                Remove-Item $uploadFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+#─────────────────────────────────────────────────────────────────────────────
 # MODE WATCH CLI
-# ─────────────────────────────────────────────────────────────────────────────
-function Start-WatchMode([int]$intervalSec) {
+#─────────────────────────────────────────────────────────────────────────────
+function Start-WatchMode {
+    param([int]$intervalSec)
+
     Write-Header "WATCH MODE — intervalle ${intervalSec}s | Ctrl+C pour arreter"
     Write-Info "Tests : $($watchTests -join ', ')" -color 'DarkGray'
 
-    $savedTests = $script:testsToRun
-    $script:testsToRun = $watchTests
-
+    $savedTests            = $script:testsToRun
+    $script:testsToRun     = $watchTests
     $run = 0
+
     try {
         while ($true) {
             $run++
@@ -901,669 +2466,167 @@ function Start-WatchMode([int]$intervalSec) {
             Save-History | Out-Null
             Start-Sleep -Seconds $intervalSec
         }
-    } finally {
+    }
+    finally {
         $script:testsToRun = $savedTests
     }
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GUI WPF — sparkline latence, watch mode, compare, export, historique auto
-# ─────────────────────────────────────────────────────────────────────────────
-function Show-Gui {
-    Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase,System.Windows.Forms
-
-    [xml]$xaml = @'
-<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="occt81 v3.0" Height="840" Width="1000"
-        Background="#020617" FontFamily="Consolas"
-        WindowStartupLocation="CenterScreen" MinWidth="700" MinHeight="640">
-  <Window.Resources>
-    <Style TargetType="Button" x:Key="Btn">
-      <Setter Property="Background"      Value="#0a1e3a"/>
-      <Setter Property="Foreground"      Value="#38bdf8"/>
-      <Setter Property="BorderBrush"     Value="#1e4976"/>
-      <Setter Property="BorderThickness" Value="1"/>
-      <Setter Property="Padding"         Value="12,6"/>
-      <Setter Property="FontFamily"      Value="Consolas"/>
-      <Setter Property="FontSize"        Value="12"/>
-      <Setter Property="Cursor"          Value="Hand"/>
-      <Setter Property="Template">
-        <Setter.Value>
-          <ControlTemplate TargetType="Button">
-            <Border Background="{TemplateBinding Background}"
-                    BorderBrush="{TemplateBinding BorderBrush}"
-                    BorderThickness="{TemplateBinding BorderThickness}"
-                    CornerRadius="3" Padding="{TemplateBinding Padding}">
-              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
-            </Border>
-            <ControlTemplate.Triggers>
-              <Trigger Property="IsMouseOver" Value="True">
-                <Setter Property="Background" Value="#142d56"/>
-              </Trigger>
-              <Trigger Property="IsEnabled" Value="False">
-                <Setter Property="Opacity" Value="0.25"/>
-              </Trigger>
-            </ControlTemplate.Triggers>
-          </ControlTemplate>
-        </Setter.Value>
-      </Setter>
-    </Style>
-    <Style TargetType="CheckBox">
-      <Setter Property="Foreground" Value="#7dd3fc"/>
-      <Setter Property="FontFamily" Value="Consolas"/>
-      <Setter Property="FontSize"   Value="12"/>
-      <Setter Property="Margin"     Value="0,2"/>
-    </Style>
-  </Window.Resources>
-
-  <Grid Margin="16">
-    <Grid.RowDefinitions>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="*"/>
-      <RowDefinition Height="3"/>
-      <RowDefinition Height="110"/>
-      <RowDefinition Height="Auto"/>
-      <RowDefinition Height="Auto"/>
-    </Grid.RowDefinitions>
-
-    <!-- Titre -->
-    <StackPanel Grid.Row="0" Margin="0,0,0,12">
-      <TextBlock Text="&#9881;  occt81  v3.0" FontSize="20" FontWeight="Bold" Foreground="#38bdf8"/>
-      <TextBlock x:Name="lblMachine" FontSize="11" Foreground="#1e3a5f" Margin="2,3,0,0"/>
-    </StackPanel>
-
-    <!-- Checkboxes -->
-    <Border Grid.Row="1" Background="#070f1e" CornerRadius="3"
-            Padding="12,8" Margin="0,0,0,10"
-            BorderBrush="#0f2140" BorderThickness="1">
-      <StackPanel>
-        <TextBlock Text="TESTS" FontSize="9" Foreground="#1e3a5f"
-                   Margin="0,0,0,7" FontWeight="Bold"/>
-        <WrapPanel>
-          <CheckBox x:Name="chkRAM"     Content="RAM"     IsChecked="True" Margin="0,0,16,0"/>
-          <CheckBox x:Name="chkLatence" Content="Latence" IsChecked="True" Margin="0,0,16,0"/>
-          <CheckBox x:Name="chkWHEA"    Content="WHEA"    IsChecked="True" Margin="0,0,16,0"/>
-          <CheckBox x:Name="chkTemp"    Content="Temp"    IsChecked="True" Margin="0,0,16,0"/>
-          <CheckBox x:Name="chkDisque"  Content="Disque"  IsChecked="True" Margin="0,0,16,0"/>
-          <CheckBox x:Name="chkGPU"     Content="GPU"     IsChecked="True" Margin="0,0,16,0"/>
-          <CheckBox x:Name="chkUptime"  Content="Uptime"  IsChecked="True"/>
-        </WrapPanel>
-      </StackPanel>
-    </Border>
-
-    <!-- Boutons -->
-    <WrapPanel Grid.Row="2" Margin="0,0,0,10">
-      <Button x:Name="btnRun"     Content="&#9654; LANCER"    Style="{StaticResource Btn}" Margin="0,0,6,0"/>
-      <Button x:Name="btnWatch"   Content="&#128262; WATCH"   Style="{StaticResource Btn}" Margin="0,0,6,0"/>
-      <Button x:Name="btnStop"    Content="&#9646;&#9646; STOP" Style="{StaticResource Btn}" Margin="0,0,6,0" IsEnabled="False"/>
-      <Button x:Name="btnExport"  Content="&#128190; EXPORT"  Style="{StaticResource Btn}" Margin="0,0,6,0" IsEnabled="False"/>
-      <Button x:Name="btnCompare" Content="&#128203; COMPARE" Style="{StaticResource Btn}" Margin="0,0,6,0" IsEnabled="False"/>
-      <Button x:Name="btnConfig"  Content="&#9881; CONFIG"    Style="{StaticResource Btn}" Margin="0,0,6,0"/>
-      <Button x:Name="btnClear"   Content="&#10005; EFFACER"  Style="{StaticResource Btn}"/>
-      <TextBlock x:Name="lblStatus" VerticalAlignment="Center"
-                 Foreground="#1e3a5f" FontSize="11" Margin="12,0,0,0"/>
-    </WrapPanel>
-
-    <!-- DataGrid -->
-    <Border Grid.Row="3" Background="#070f1e" CornerRadius="3"
-            BorderBrush="#0f2140" BorderThickness="1">
-      <DataGrid x:Name="dgResults" AutoGenerateColumns="False"
-                Background="#070f1e" Foreground="#e2e8f0"
-                GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#050d1a"
-                RowBackground="#070f1e" AlternatingRowBackground="#0a1628"
-                BorderThickness="0" CanUserAddRows="False" IsReadOnly="True"
-                ColumnHeaderHeight="28" FontSize="12">
-        <DataGrid.ColumnHeaderStyle>
-          <Style TargetType="DataGridColumnHeader">
-            <Setter Property="Background"      Value="#030810"/>
-            <Setter Property="Foreground"      Value="#1e3a5f"/>
-            <Setter Property="FontFamily"      Value="Consolas"/>
-            <Setter Property="FontSize"        Value="10"/>
-            <Setter Property="Padding"         Value="10,0"/>
-            <Setter Property="BorderThickness" Value="0,0,0,1"/>
-            <Setter Property="BorderBrush"     Value="#0f2140"/>
-          </Style>
-        </DataGrid.ColumnHeaderStyle>
-        <DataGrid.Columns>
-          <DataGridTextColumn Header="HEURE"  Binding="{Binding Heure}"  Width="62"/>
-          <DataGridTextColumn Header="TEST"   Binding="{Binding Test}"   Width="200"/>
-          <DataGridTemplateColumn Header="STATUT" Width="72">
-            <DataGridTemplateColumn.CellTemplate>
-              <DataTemplate>
-                <TextBlock Text="{Binding Status}" FontWeight="Bold" Padding="10,4">
-                  <TextBlock.Style>
-                    <Style TargetType="TextBlock">
-                      <Style.Triggers>
-                        <DataTrigger Binding="{Binding Status}" Value="OK">
-                          <Setter Property="Foreground" Value="#4ade80"/>
-                        </DataTrigger>
-                        <DataTrigger Binding="{Binding Status}" Value="WARN">
-                          <Setter Property="Foreground" Value="#fbbf24"/>
-                        </DataTrigger>
-                        <DataTrigger Binding="{Binding Status}" Value="FAIL">
-                          <Setter Property="Foreground" Value="#f87171"/>
-                        </DataTrigger>
-                        <DataTrigger Binding="{Binding Status}" Value="N/A">
-                          <Setter Property="Foreground" Value="#1e3a5f"/>
-                        </DataTrigger>
-                      </Style.Triggers>
-                    </Style>
-                  </TextBlock.Style>
-                </TextBlock>
-              </DataTemplate>
-            </DataGridTemplateColumn.CellTemplate>
-          </DataGridTemplateColumn>
-          <DataGridTextColumn Header="VALEUR" Binding="{Binding Valeur}" Width="130"/>
-          <DataGridTextColumn Header="DETAIL" Binding="{Binding Detail}" Width="*"/>
-        </DataGrid.Columns>
-      </DataGrid>
-    </Border>
-
-    <!-- Progress -->
-    <ProgressBar x:Name="pbProgress" Grid.Row="4"
-                 Background="#070f1e" Foreground="#38bdf8" BorderThickness="0"
-                 Minimum="0" Maximum="100" Value="0"/>
-
-    <!-- Sparkline latence -->
-    <Border Grid.Row="5" Background="#070f1e" CornerRadius="3"
-            BorderBrush="#0f2140" BorderThickness="1" Padding="10,6" Margin="0,6,0,6">
-      <Grid>
-        <Grid.RowDefinitions>
-          <RowDefinition Height="Auto"/>
-          <RowDefinition Height="*"/>
-        </Grid.RowDefinitions>
-        <TextBlock Grid.Row="0" Text="LATENCE — SPARKLINE (ms)"
-                   FontSize="9" Foreground="#1e3a5f" FontWeight="Bold"
-                   Margin="0,0,0,3"/>
-        <Canvas x:Name="sparkCanvas" Grid.Row="1" ClipToBounds="True" Background="Transparent"/>
-      </Grid>
-    </Border>
-
-    <!-- Conclusion -->
-    <Border x:Name="borderConcl" Grid.Row="6" CornerRadius="3" Padding="14,10"
-            Background="#070f1e" BorderBrush="#0f2140" BorderThickness="1" Margin="0,0,0,0">
-      <TextBlock x:Name="lblConcl" FontSize="13" FontWeight="Bold"
-                 Foreground="#1e3a5f" Text="En attente du diagnostic..."/>
-    </Border>
-
-    <!-- Footer hint -->
-    <TextBlock Grid.Row="7" FontSize="9" Foreground="#0a1628" Margin="0,4,0,0"
-               Text="Historique : %APPDATA%\occt81\history\  |  Config : %APPDATA%\occt81\occt81.config.json"/>
-  </Grid>
-</Window>
-'@
-
-    $reader = [System.Xml.XmlNodeReader]::new($xaml)
-    $window = [Windows.Markup.XamlReader]::Load($reader)
-
-    # Controles
-    $dgResults   = $window.FindName('dgResults')
-    $btnRun      = $window.FindName('btnRun')
-    $btnWatch    = $window.FindName('btnWatch')
-    $btnStop     = $window.FindName('btnStop')
-    $btnExport   = $window.FindName('btnExport')
-    $btnCompare  = $window.FindName('btnCompare')
-    $btnConfig   = $window.FindName('btnConfig')
-    $btnClear    = $window.FindName('btnClear')
-    $lblStatus   = $window.FindName('lblStatus')
-    $lblConcl    = $window.FindName('lblConcl')
-    $lblMachine  = $window.FindName('lblMachine')
-    $pbProgress  = $window.FindName('pbProgress')
-    $borderConcl = $window.FindName('borderConcl')
-    $sparkCanvas = $window.FindName('sparkCanvas')
-
-    $osInfo = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-    $lblMachine.Text = "$env:COMPUTERNAME  |  $($osInfo.Caption)  |  $(if($IsAdmin){'Admin'}else{'Standard'})"
-
-    $observableResults = [System.Collections.ObjectModel.ObservableCollection[PSCustomObject]]::new()
-    $dgResults.ItemsSource = $observableResults
-
-    $script:watchCts  = $null
-    $script:currentPs = $null
-
-    # ── Lancement runspace ─────────────────────────────────────────────────
-    function Start-GuiRunspace([string[]]$selTests, [bool]$isWatch, [int]$watchSec) {
-
-        $btnRun.IsEnabled     = $false
-        $btnWatch.IsEnabled   = $false
-        $btnExport.IsEnabled  = $false
-        $btnCompare.IsEnabled = $false
-        $btnStop.IsEnabled    = $true
-        $pbProgress.Value     = 0
-        $lblStatus.Text       = if ($isWatch) { "Watch en cours..." } else { "Diagnostic en cours..." }
-
-        if (-not $isWatch) { $observableResults.Clear(); $results.Clear() }
-
-        $script:watchCts = [System.Threading.CancellationTokenSource]::new()
-
-        $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
-        $rs.ApartmentState = 'STA'; $rs.ThreadOptions = 'ReuseThread'; $rs.Open()
-
-        foreach ($vn in @('RamSize','Passes','IsAdmin','cfg','historyDir')) {
-            $rs.SessionStateProxy.SetVariable($vn, (Get-Variable $vn -Scope Script -ErrorAction SilentlyContinue).Value)
-        }
-        $rs.SessionStateProxy.SetVariable('selTests',       $selTests)
-        $rs.SessionStateProxy.SetVariable('isWatch',        $isWatch)
-        $rs.SessionStateProxy.SetVariable('watchSec',       $watchSec)
-        $rs.SessionStateProxy.SetVariable('dispatcher',     $window.Dispatcher)
-        $rs.SessionStateProxy.SetVariable('observableR',    $observableResults)
-        $rs.SessionStateProxy.SetVariable('resultsRef',     $results)
-        $rs.SessionStateProxy.SetVariable('pbProgress',     $pbProgress)
-        $rs.SessionStateProxy.SetVariable('btnRun',         $btnRun)
-        $rs.SessionStateProxy.SetVariable('btnWatch',       $btnWatch)
-        $rs.SessionStateProxy.SetVariable('btnStop',        $btnStop)
-        $rs.SessionStateProxy.SetVariable('btnExport',      $btnExport)
-        $rs.SessionStateProxy.SetVariable('btnCompare',     $btnCompare)
-        $rs.SessionStateProxy.SetVariable('lblStatus',      $lblStatus)
-        $rs.SessionStateProxy.SetVariable('lblConcl',       $lblConcl)
-        $rs.SessionStateProxy.SetVariable('borderConcl',    $borderConcl)
-        $rs.SessionStateProxy.SetVariable('sparkCanvas',    $sparkCanvas)
-        $rs.SessionStateProxy.SetVariable('cts',            $script:watchCts)
-
-        $ps = [System.Management.Automation.PowerShell]::Create()
-        $ps.Runspace = $rs
-        $script:currentPs = $ps
-
-        $null = $ps.AddScript({
-
-            function Add-GR([string]$t,[string]$s,[string]$v,[string]$d='') {
-                $obj=[PSCustomObject]@{Test=$t;Status=$s;Valeur=$v;Detail=$d;Heure=(Get-Date -Format 'HH:mm:ss')}
-                $resultsRef.Add($obj)
-                $dispatcher.Invoke([Action]{ $observableR.Add($obj) })
-            }
-            function SetProg([int]$v) { $dispatcher.Invoke([Action]{ $pbProgress.Value=$v }) }
-
-            function Set-Run-TestsOnce([string[]]$tests) {
-                $total=$tests.Count; $done=0; $latSmp=$null
-
-                if ($tests -contains 'RAM') {
-                    $sz=[int]($RamSize*1MB); $err=0
-                    $pats=@([byte]0x00,[byte]0xFF,[byte]0xAA,[byte]0x55,[byte]0xCC,[byte]0x33)
-                    for ($p=1;$p -le $Passes;$p++) {
-                        $pat=$pats[($p-1)%$pats.Count]
-                        [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
-                        $buf=[byte[]]::new($sz)
-                        for ($i=0;$i -lt $sz;$i++) { $buf[$i]=$pat }
-                        $ok=$true
-                        for ($i=0;$i -lt $sz;$i++) { if ($buf[$i] -ne $pat) { $ok=$false;break } }
-                        if (-not $ok) { $err++ }
-                        if ($p%2 -eq 0) {
-                            $alt=if($pat -eq [byte]0xAA){[byte]0x55}else{[byte]0xAA}
-                            for ($i=0;$i -lt $sz;$i+=2) { $buf[$i]=$alt }
-                            $ec=$false
-                            for ($i=0;$i -lt $sz;$i++) {
-                                $exp=if($i%2 -eq 0){$alt}else{$pat}
-                                if ($buf[$i] -ne $exp) { $ec=$true;break }
-                            }
-                            if ($ec) { $err++ }
-                        }
-                    }
-                    Add-GR 'RAM' (if($err -eq 0){'OK'}else{'FAIL'}) (if($err -eq 0){'0 erreur'}else{"$err erreur(s)"}) "Patterns+checkerboard | ${RamSize}Mo x ${Passes} passes | NOTE: ne remplace pas MemTest86"
-                    $done++; SetProg([int]($done/$total*100))
-                }
-
-                if ($tests -contains 'Latence') {
-                    $w=[System.Diagnostics.Stopwatch]::StartNew(); while($w.ElapsedMilliseconds -lt 500){$null=1+1}; $w.Stop()
-                    $n=200; $lat=[double[]]::new($n); $sw=[System.Diagnostics.Stopwatch]::new()
-                    for ($i=0;$i -lt $n;$i++) {
-                        $sw.Restart(); $x=0
-                        for ($j=0;$j -lt 50000;$j++) { $x=$x -bxor ($j*7) }
-                        $sw.Stop(); $lat[$i]=$sw.Elapsed.TotalMilliseconds
-                    }
-                    $avg=($lat|Measure-Object -Average).Average
-                    $s2=$lat|Sort-Object
-                    $p99=$s2[[Math]::Min([int]($n*0.99),$n-1)]
-                    $p95=$s2[[Math]::Min([int]($n*0.95),$n-1)]
-                    $mxL=($lat|Measure-Object -Maximum).Maximum
-                    $txt="Avg={0:N2}ms P95={1:N2}ms P99={2:N2}ms Max={3:N2}ms" -f $avg,$p95,$p99,$mxL
-                    Add-GR 'Latence (moy)' (if($avg -lt $cfg.LatMoyMax){'OK'}else{'WARN'}) ("{0:N2} ms" -f $avg) $txt
-                    Add-GR 'Latence (P99)' (if($p99 -lt $cfg.LatP99Max){'OK'}else{'WARN'}) ("{0:N2} ms" -f $p99) $txt
-                    $latSmp=$lat
-                    $done++; SetProg([int]($done/$total*100))
-                }
-
-                if ($tests -contains 'WHEA') {
-                    if (-not $IsAdmin) {
-                        Add-GR 'WHEA' 'N/A' 'Admin requis' ''
-                    } else {
-                        $ev=@(); try { $ev=@(Get-WinEvent -FilterHashtable @{LogName='System';ProviderName='Microsoft-Windows-WHEA-Logger';Id=17,18,19,20,41,4101} -MaxEvents 50 -ErrorAction SilentlyContinue) } catch {}
-                        $wc=$ev.Count; $cc=@($ev|Where-Object{$_.Id -eq 41}).Count
-                        Add-GR 'WHEA total'    (if($wc -eq 0){'OK'}else{'WARN'}) "$wc evenement(s)" ''
-                        Add-GR 'WHEA critique' (if($cc -eq 0){'OK'}else{'FAIL'}) "$cc id=41" ''
-                    }
-                    $done++; SetProg([int]($done/$total*100))
-                }
-
-                if ($tests -contains 'Temp') {
-                    $cel=$null; $src='inconnu'
-                    if ($IsAdmin) {
-                        try { $rw=(Get-CimInstance -Namespace 'root/WMI' -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction Stop|Select-Object -First 1).CurrentTemperature; if($rw -gt 0){$cel=[Math]::Round(($rw-2732)/10.0,1);$src='ACPI'} } catch {}
-                    }
-                    if ($null -eq $cel) {
-                        try { $tz=Get-CimInstance -Namespace 'root/CIMV2' -ClassName 'Win32_PerfFormattedData_Counters_ThermalZoneInformation' -ErrorAction Stop|Select-Object -First 1; if($tz -and $tz.Temperature -gt 0){$cel=[Math]::Round($tz.Temperature/10.0-273.15,1);$src='ThermalZone'} } catch {}
-                    }
-                    if ($null -eq $cel) {
-                        try { $o=Get-CimInstance -Namespace 'root/OpenHardwareMonitor' -ClassName Sensor -ErrorAction Stop|Where-Object{$_.SensorType -eq 'Temperature' -and $_.Name -match 'CPU|Package|Core'}|Sort-Object Value -Descending|Select-Object -First 1; if($o -and $o.Value -gt 0){$cel=[Math]::Round($o.Value,1);$src="OHM:$($o.Name)"} } catch {}
-                    }
-                    if ($null -eq $cel) {
-                        try { $l=Get-CimInstance -Namespace 'root/LibreHardwareMonitor' -ClassName Sensor -ErrorAction Stop|Where-Object{$_.SensorType -eq 'Temperature' -and $_.Name -match 'CPU|Package|Core'}|Sort-Object Value -Descending|Select-Object -First 1; if($l -and $l.Value -gt 0){$cel=[Math]::Round($l.Value,1);$src="LHM:$($l.Name)"} } catch {}
-                    }
-                    if ($null -ne $cel -and $cel -gt 0 -and $cel -lt 150) {
-                        $st=if($cel -lt $cfg.TempCPUMax){'OK'}elseif($cel -lt ($cfg.TempCPUMax+10)){'WARN'}else{'FAIL'}
-                        Add-GR 'Temperature CPU' $st "${cel}°C" "Source: $src"
-                    } else {
-                        Add-GR 'Temperature CPU' 'N/A' 'Source indisponible' 'Lancer OHM ou LHM'
-                    }
-                    $done++; SetProg([int]($done/$total*100))
-                }
-
-                if ($tests -contains 'Disque') {
-                    $drv=Get-PSDrive -PSProvider FileSystem|Where-Object{$null -ne $_.Used -and $null -ne $_.Free}
-                    foreach ($d in $drv) {
-                        $tot=$d.Used+$d.Free; if($tot -le 0){continue}
-                        $pct=[Math]::Round($d.Used/$tot*100,1); $fg=[Math]::Round($d.Free/1GB,1)
-                        Add-GR "Disque $($d.Name):" (if($pct -lt $cfg.DiskPctMax){'OK'}elseif($pct -lt 95){'WARN'}else{'FAIL'}) "${pct}% utilise" "${fg} Go libres"
-                    }
-                    try {
-                        $pd=Get-PhysicalDisk -ErrorAction Stop
-                        foreach ($dk in $pd) {
-                            try {
-                                $rl=$dk|Get-StorageReliabilityCounter -ErrorAction Stop
-                                $h=$dk.HealthStatus; $pts=@()
-                                if($rl.Wear -gt 0){$pts+="Wear:$($rl.Wear)%"}
-                                if($rl.Temperature -gt 0){$pts+="Temp:$($rl.Temperature)°C"}
-                                if($rl.ReadErrorsTotal -gt 0){$pts+="RdErr:$($rl.ReadErrorsTotal)"}
-                                if($null -ne $rl.WriteErrorsUncorrected -and $rl.WriteErrorsUncorrected -gt 0){$pts+="WrErr:$($rl.WriteErrorsUncorrected)"}
-                                if($null -ne $rl.MediaErrors -and $rl.MediaErrors -gt 0){$pts+="MdErr:$($rl.MediaErrors)"}
-                                $det=if($pts.Count -gt 0){$pts -join ' | '}else{'OK'}
-                                $st='OK'
-                                if($h -ne 'Healthy'){$st='WARN'}
-                                if($null -ne $rl.WriteErrorsUncorrected -and $rl.WriteErrorsUncorrected -gt 0){$st='FAIL'}
-                                if($rl.Wear -gt 90){$st='FAIL'}elseif($rl.Wear -gt 75){$st='WARN'}
-                                $val="[$h]"; if($rl.Wear -gt 0){$val+=" W=$($rl.Wear)%"}
-                                Add-GR "SMART: $($dk.FriendlyName)" $st $val $det
-                            } catch { Add-GR "SMART: $($dk.FriendlyName)" 'N/A' 'Non supporte' '' }
-                        }
-                    } catch { Add-GR 'SMART' 'N/A' 'Indisponible' '' }
-                    $tmp=[System.IO.Path]::GetTempFileName()
-                    try {
-                        $buf=[byte[]]::new([int](50*1MB)); [System.Random]::new().NextBytes($buf)
-                        $sw2=[System.Diagnostics.Stopwatch]::StartNew()
-                        [System.IO.File]::WriteAllBytes($tmp,$buf); $sw2.Stop()
-                        $mbps=[Math]::Round(50/$sw2.Elapsed.TotalSeconds,0)
-                        Add-GR 'Disque — Ecriture' (if($mbps -gt $cfg.DiskWriteMin){'OK'}elseif($mbps -gt 30){'WARN'}else{'FAIL'}) "${mbps} Mo/s" '50 Mo temp'
-                    } catch { Add-GR 'Disque — Ecriture' 'N/A' 'Erreur I/O' '' }
-                    finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
-                    $done++; SetProg([int]($done/$total*100))
-                }
-
-                if ($tests -contains 'GPU') {
-                    $fnd=$false
-                    $sm=@("$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe","$env:SystemRoot\System32\nvidia-smi.exe")|Where-Object{Test-Path $_ -EA SilentlyContinue}|Select-Object -First 1
-                    if (-not $sm) { try{$sm=(Get-Command 'nvidia-smi.exe' -ErrorAction Stop).Source}catch{} }
-                    if ($sm) {
-                        try {
-                            $so=& $sm --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total,power.draw,pstate --format=csv,noheader,nounits 2>$null
-                            foreach ($ln in ($so -split "`n"|Where-Object{$_.Trim()-ne''})) {
-                                $p=$ln -split ','|ForEach-Object{$_.Trim()}
-                                if($p.Count -lt 5){continue}
-                                $tg=if($p[1]-match'^\d'){[int]$p[1]}else{$null}
-                                $ug=if($p[2]-match'^\d'){[int]$p[2]}else{$null}
-                                $mu=if($p[3]-match'^\d'){[int]$p[3]}else{$null}
-                                $mt=if($p[4]-match'^\d'){[int]$p[4]}else{$null}
-                                $pw2=if($p.Count -gt 5 -and $p[5]-match'^\d'){[double]$p[5]}else{$null}
-                                $st='OK'
-                                if($tg -and $tg -gt $cfg.TempGPUMax){$st='FAIL'}elseif($tg -and $tg -gt ($cfg.TempGPUMax-10)){$st='WARN'}
-                                $vl=if($tg){"${tg}°C"}else{'N/A'}
-                                $dt=""; if($null -ne $ug){$dt+="Load:${ug}% "}; if($mu -and $mt){$dt+="VRAM:${mu}/${mt}MiB "}; if($null -ne $pw2){$dt+="Pwr:$([Math]::Round($pw2,1))W "}; $dt+="| nvidia-smi"
-                                Add-GR "GPU: $($p[0])" $st $vl $dt
-                                $fnd=$true
-                            }
-                        } catch {}
-                    }
-                    if (-not $fnd) {
-                        try {
-                            $og=@(Get-CimInstance -Namespace 'root/OpenHardwareMonitor' -ClassName Sensor -ErrorAction Stop|Where-Object{$_.SensorType -eq 'Temperature' -and $_.Name -match 'GPU'})
-                            foreach ($g in $og) { if($g.Value -gt 0){$st=if($g.Value -lt $cfg.TempGPUMax){'OK'}else{'WARN'}; Add-GR "GPU:$($g.Name)" $st "$([Math]::Round($g.Value,1))°C" 'OHM'; $fnd=$true} }
-                        } catch {}
-                    }
-                    if (-not $fnd) {
-                        try {
-                            $gc2=Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop
-                            foreach ($g in $gc2) {
-                                $vr=if($g.AdapterRAM -gt 0){[Math]::Round($g.AdapterRAM/1MB,0)}else{'?'}
-                                Add-GR "GPU: $($g.Name)" (if($g.Status -eq 'OK'){'OK'}else{'WARN'}) "VRAM ${vr}Mo" "Driver:$($g.DriverVersion) | Info driver seul"
-                            }
-                        } catch { Add-GR 'GPU' 'N/A' 'Indisponible' '' }
-                    }
-                    $done++; SetProg([int]($done/$total*100))
-                }
-
-                if ($tests -contains 'Uptime') {
-                    $os2=Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
-                    $cp2=Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue|Select-Object -First 1
-                    $ri2=Get-CimInstance Win32_PhysicalMemory -ErrorAction SilentlyContinue|Measure-Object -Property Capacity -Sum
-                    if ($os2) {
-                        $up=(Get-Date)-$os2.LastBootUpTime; $dy=[Math]::Floor($up.TotalDays)
-                        $rGB=[Math]::Round($ri2.Sum/1GB,1)
-                        $rU=[Math]::Round(($os2.TotalVisibleMemorySize-$os2.FreePhysicalMemory)/1MB,1)
-                        $rT=[Math]::Round($os2.TotalVisibleMemorySize/1MB,1)
-                        $rP=[Math]::Round($rU/$rT*100,1)
-                        Add-GR 'Uptime'       (if($dy -lt $cfg.UptimeDaysWarn){'OK'}else{'WARN'}) "${dy}j $($up.Hours)h $($up.Minutes)m" "OS: $($os2.Caption)"
-                        Add-GR 'RAM utilisee' (if($rP -lt $cfg.RamPctWarn){'OK'}elseif($rP -lt $cfg.RamPctFail){'WARN'}else{'FAIL'}) "${rP}%" "Physique: ${rGB} Go"
-                        Add-GR 'CPU info'     'OK' $cp2.Name "Cores:$($cp2.NumberOfCores)/Logiques:$($cp2.NumberOfLogicalProcessors)"
-                    }
-                    $done++; SetProg([int]($done/$total*100))
-                }
-
-                return $latSmp
-            }
-
-            # ── Boucle runs ────────────────────────────────────────────────
-            $loopN = 0
-            do {
-                $loopN++
-                if ($loopN -gt 1) {
-                    $dispatcher.Invoke([Action]{ $observableR.Clear(); $resultsRef.Clear() })
-                }
-
-                $latSamples = Set-Run-TestsOnce $selTests
-
-                # Sauvegarde historique
-                try {
-                    if (-not (Test-Path $historyDir)) { New-Item -ItemType Directory -Path $historyDir -Force|Out-Null }
-                    $f=Join-Path $historyDir "$(Get-Date -Format 'yyyy-MM-ddTHH-mm-ss').json"
-                    @{Date=(Get-Date -Format 'o');Machine=$env:COMPUTERNAME;Results=@($resultsRef|ForEach-Object{@{Test=$_.Test;Status=$_.Status;Valeur=$_.Valeur;Detail=$_.Detail}})} |
-                        ConvertTo-Json -Depth 5 | Set-Content $f -Encoding UTF8
-                } catch {}
-
-                $crit=@($resultsRef|Where-Object{$_.Status -eq 'FAIL'}).Count
-                $warn=@($resultsRef|Where-Object{$_.Status -eq 'WARN'}).Count
-                $ls=$latSamples
-
-                $dispatcher.Invoke([Action]{
-                    $pbProgress.Value=100
-                    if (-not $isWatch) {
-                        $btnRun.IsEnabled=$true; $btnWatch.IsEnabled=$true
-                        $btnStop.IsEnabled=$false; $btnExport.IsEnabled=$true; $btnCompare.IsEnabled=$true
-                    }
-                    $ts=Get-Date -Format 'HH:mm:ss'
-                    $lblStatus.Text=if($isWatch){"Watch run $loopN — $ts"}else{"Termine $ts"}
-
-                    # Conclusion
-                    if ($crit -gt 0) {
-                        $lblConcl.Text='!! PROBLEME MATERIEL DETECTE — verifiez RAM et WHEA'
-                        $lblConcl.Foreground=[Windows.Media.Brushes]::Salmon
-                        $borderConcl.Background=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(58,16,16))
-                    } elseif ($warn -gt 0) {
-                        $lblConcl.Text='!! AVERTISSEMENTS — surveillance recommandee'
-                        $lblConcl.Foreground=[Windows.Media.Brushes]::Gold
-                        $borderConcl.Background=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(55,45,10))
-                    } else {
-                        $lblConcl.Text='Systeme stable — aucun probleme detecte'
-                        $lblConcl.Foreground=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(74,222,128))
-                        $borderConcl.Background=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(12,40,12))
-                    }
-
-                    # Sparkline
-                    $sparkCanvas.Children.Clear()
-                    if ($ls -and $ls.Count -gt 0) {
-                        $w=$sparkCanvas.ActualWidth; $h=$sparkCanvas.ActualHeight
-                        if($w -le 0){$w=900;$h=72}
-                        $maxV=($ls|Measure-Object -Maximum).Maximum
-                        $minV=($ls|Measure-Object -Minimum).Minimum
-                        $rng=if($maxV-$minV -lt 0.01){1}else{$maxV-$minV}
-                        $n=$ls.Count; $sx=$w/[Math]::Max($n-1,1)
-                        # Grille
-                        foreach ($pct in @(0.25,0.5,0.75)) {
-                            $gl=[Windows.Shapes.Line]::new()
-                            $gl.X1=0;$gl.X2=$w;$gl.Y1=$h-$pct*$h;$gl.Y2=$h-$pct*$h
-                            $gl.Stroke=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(10,22,40))
-                            $gl.StrokeThickness=1; $sparkCanvas.Children.Add($gl)|Out-Null
-                        }
-                        # Aire remplie sous la courbe
-                        $poly=[Windows.Shapes.Polygon]::new()
-                        $poly.Fill=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromArgb(30,56,189,248))
-                        $poly.Stroke=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(56,189,248))
-                        $poly.StrokeThickness=1.5
-                        $pts=[Windows.Media.PointCollection]::new()
-                        $pts.Add([Windows.Point]::new(0,$h))|Out-Null
-                        for ($i=0;$i -lt $n;$i++) {
-                            $x=$i*$sx; $nr=($ls[$i]-$minV)/$rng; $y=$h-($nr*($h-6))-3
-                            $pts.Add([Windows.Point]::new($x,$y))|Out-Null
-                        }
-                        $pts.Add([Windows.Point]::new(($n-1)*$sx,$h))|Out-Null
-                        $poly.Points=$pts; $sparkCanvas.Children.Add($poly)|Out-Null
-                        # Labels
-                        $lmx=[Windows.Controls.TextBlock]::new(); $lmx.Text=("{0:N2}ms"-f $maxV)
-                        $lmx.Foreground=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(51,65,85))
-                        $lmx.FontSize=9; [Windows.Controls.Canvas]::SetLeft($lmx,2); [Windows.Controls.Canvas]::SetTop($lmx,0)
-                        $sparkCanvas.Children.Add($lmx)|Out-Null
-                        $lmn=[Windows.Controls.TextBlock]::new(); $lmn.Text=("{0:N2}ms"-f $minV)
-                        $lmn.Foreground=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(51,65,85))
-                        $lmn.FontSize=9; [Windows.Controls.Canvas]::SetLeft($lmn,2); [Windows.Controls.Canvas]::SetTop($lmn,$h-14)
-                        $sparkCanvas.Children.Add($lmn)|Out-Null
-                    }
-                })
-
-                if ($isWatch -and -not $cts.IsCancellationRequested) {
-                    Start-Sleep -Seconds $watchSec
-                }
-
-            } while ($isWatch -and -not $cts.IsCancellationRequested)
-
-            if ($isWatch) {
-                $dispatcher.Invoke([Action]{
-                    $btnRun.IsEnabled=$true; $btnWatch.IsEnabled=$true
-                    $btnStop.IsEnabled=$false; $btnExport.IsEnabled=$true; $btnCompare.IsEnabled=$true
-                    $lblStatus.Text="Watch arrete"
-                })
-            }
-        })
-
-        $null = $ps.BeginInvoke()
-    }
-
-    # ── Evenements ─────────────────────────────────────────────────────────
-
-    $btnRun.Add_Click({
-        $sel=@(); foreach ($t in @('RAM','Latence','WHEA','Temp','Disque','GPU','Uptime')) {
-            $chk=$window.FindName("chk$t"); if($chk -and $chk.IsChecked){$sel+=$t}
-        }
-        if ($sel.Count -eq 0) { $sel=@('RAM','Latence','WHEA','Temp','Disque','GPU','Uptime') }
-        Start-GuiRunspace -selTests $sel -isWatch $false -watchSec 0
-    })
-
-    $btnWatch.Add_Click({
-        $sel=@(); foreach ($t in @('Latence','Temp','Disque','Uptime')) {
-            $chk=$window.FindName("chk$t"); if($chk -and $chk.IsChecked){$sel+=$t}
-        }
-        if ($sel.Count -eq 0) { $sel=@('Latence','Temp','Disque','Uptime') }
-        Start-GuiRunspace -selTests $sel -isWatch $true -watchSec 30
-    })
-
-    $btnStop.Add_Click({
-        if ($script:watchCts) { $script:watchCts.Cancel() }
-        $lblStatus.Text='Arret demande...'
-        $btnStop.IsEnabled=$false
-    })
-
-    $btnClear.Add_Click({
-        $observableResults.Clear(); $results.Clear()
-        $pbProgress.Value=0; $sparkCanvas.Children.Clear()
-        $lblStatus.Text=''; $lblConcl.Text='En attente du diagnostic...'
-        $lblConcl.Foreground=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(30,58,95))
-        $borderConcl.Background=[Windows.Media.SolidColorBrush]::new([Windows.Media.Color]::FromRgb(7,15,30))
-        $btnExport.IsEnabled=$false; $btnCompare.IsEnabled=$false
-    })
-
-    $btnExport.Add_Click({
-        $dlg=[Microsoft.Win32.SaveFileDialog]::new()
-        $dlg.Title='Exporter le rapport'
-        $dlg.Filter='HTML (*.html)|*.html|CSV (*.csv)|*.csv|Texte (*.txt)|*.txt'
-        $dlg.DefaultExt='html'
-        $dlg.FileName="occt81_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-        if ($dlg.ShowDialog()) {
-            $script:Export=$dlg.FileName; Export-Report
-            $lblStatus.Text="Exporte : $($dlg.SafeFileName)"
-        }
-    })
-
-    $btnCompare.Add_Click({
-        $dlg=[Microsoft.Win32.OpenFileDialog]::new()
-        $dlg.Title='Choisir un rapport JSON precedent'
-        $dlg.Filter='JSON (*.json)|*.json'
-        if (Test-Path $historyDir) { $dlg.InitialDirectory=$historyDir }
-        if ($dlg.ShowDialog()) {
-            Compare-History $dlg.FileName
-            [System.Windows.MessageBox]::Show('Comparaison affichee dans la console.','occt81','OK','Information')|Out-Null
-        }
-    })
-
-    $btnConfig.Add_Click({
-        # Crée un config par défaut si absent
-        $cfgDir = Join-Path $env:APPDATA 'occt81'
-        if (-not (Test-Path $cfgDir)) { New-Item -ItemType Directory $cfgDir -Force|Out-Null }
-        $cfgFile = Join-Path $cfgDir 'occt81.config.json'
-        if (-not (Test-Path $cfgFile)) {
-            @{
-                LatMoyMax=20; LatP99Max=100; TempCPUMax=85; TempGPUMax=90
-                DiskPctMax=85; DiskWriteMin=100; RamPctWarn=80; RamPctFail=90; UptimeDaysWarn=30
-            } | ConvertTo-Json | Set-Content $cfgFile -Encoding UTF8
-        }
-        Start-Process notepad.exe $cfgFile
-    })
-
-    $null = $window.ShowDialog()
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# POINT D'ENTREE
-# ─────────────────────────────────────────────────────────────────────────────
-if ($GUI) { Show-Gui; exit 0 }
-
+#─────────────────────────────────────────────────────────────────────────────
+# POINT D ENTREE
+#─────────────────────────────────────────────────────────────────────────────
 if ($Watch -gt 0) {
-    Write-Header "occt81 v3.0 — $env:COMPUTERNAME"
+    Write-Header "occt81 v4.2 — $env:COMPUTERNAME"
     Start-WatchMode -intervalSec $Watch
     exit 0
 }
 
 # CLI standard
-Write-Header "occt81 v3.0 — $env:COMPUTERNAME"
+Write-Header "occt81 v4.2 — $env:COMPUTERNAME"
+
 if (-not $Silent) {
     $osName = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
     Write-Info "OS     : $osName" -color 'DarkGray'
-    Write-Info "Admin  : $(if($IsAdmin){'Oui'}else{'Non — WHEA/Temp/SMART indisponibles'})" `
+    Write-Info "Admin  : $(if ($IsAdmin) { 'Oui' } else { 'Non — WHEA/Temp/SMART indisponibles' })" `
         -color $(if ($IsAdmin) { 'DarkGray' } else { 'DarkYellow' })
-    Write-Info "Tests  : $($testsToRun -join ', ')" -color 'DarkGray'
+    Write-Info "Tests  : $($script:testsToRun -join ', ')" -color 'DarkGray'
     if ($configPath) { Write-Info "Config : $configPath" -color 'DarkGray' }
 }
 
-Invoke-AllTests
-Write-Summary
-Save-History | Out-Null
-if ($Compare) { Compare-History -jsonPath $Compare }
-Export-Report
+$ohmProc = $null
+
+try {
+    # Lancement OHM UNE SEULE FOIS avant les tests
+    $ohmProc = Start-OhmIfNeeded
+
+    Invoke-AllTests
+    Write-Summary
+    Save-History | Out-Null
+    if ($Compare) { Compare-History -jsonPath $Compare }
+    Export-Report
+}
+catch {
+    # Crash log enrichi
+    try {
+        $crashDir = Join-Path $env:APPDATA 'occt81'
+        if (-not (Test-Path $crashDir)) { New-Item -ItemType Directory $crashDir -Force | Out-Null }
+        $crashLog = Join-Path $crashDir "crashlog_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+
+        # Chaine d exceptions complete (inner exceptions)
+        $exChain = @()
+        $ex = $_.Exception
+        $depth = 0
+        while ($ex -and $depth -lt 10) {
+            $exChain += "  [$depth] $($ex.GetType().FullName) : $($ex.Message)"
+            $ex = $ex.InnerException
+            $depth++
+        }
+
+        # Infos systeme
+        $osInfo  = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+        $cpuInfo = Get-CimInstance Win32_Processor       -ErrorAction SilentlyContinue | Select-Object -First 1
+        $ramInfo = Get-CimInstance Win32_PhysicalMemory  -ErrorAction SilentlyContinue |
+                   Measure-Object -Property Capacity -Sum
+        $uptime  = if ($osInfo) { (Get-Date) - $osInfo.LastBootUpTime } else { $null }
+
+        $sysLines = @(
+            "OS          : $(if ($osInfo)  { $osInfo.Caption + ' (Build ' + $osInfo.BuildNumber + ')' } else { 'Inconnu' })",
+            "Architecture: $($env:PROCESSOR_ARCHITECTURE)",
+            "CPU         : $(if ($cpuInfo) { $cpuInfo.Name } else { 'Inconnu' })",
+            "Coeurs log. : $(if ($cpuInfo) { $cpuInfo.NumberOfLogicalProcessors } else { '?' })",
+            "RAM totale  : $(if ($ramInfo.Sum) { [Math]::Round($ramInfo.Sum/1GB,1).ToString() + ' Go' } else { 'Inconnu' })",
+            "RAM libre   : $(if ($osInfo) { [Math]::Round($osInfo.FreePhysicalMemory/1MB,0).ToString() + ' Mo' } else { 'Inconnu' })",
+            "Uptime      : $(if ($uptime) { "$([Math]::Floor($uptime.TotalDays))j $($uptime.Hours)h $($uptime.Minutes)m" } else { 'N/A' })",
+            "PowerShell  : $($PSVersionTable.PSVersion)",
+            "CLR         : $([System.Runtime.InteropServices.RuntimeEnvironment]::GetSystemVersion())",
+            "Admin       : $(if ($IsAdmin) { 'Oui' } else { 'Non' })",
+            "User        : $($env:USERDOMAIN)\$($env:USERNAME)"
+        )
+
+        # Etat compilation RamEngine
+        $ramEngineStatus = if (([System.Management.Automation.PSTypeName]'RamEngine').Type) {
+            if ($script:RamEngineSafeMode) { 'Compile en mode SAFE (Buffer.BlockCopy, sans /unsafe)' }
+            else { 'Compile avec succes (mode unsafe natif)' }
+        } elseif ($script:RamEngineCompileError) {
+            "ECHEC — $script:RamEngineCompileError"
+        } else {
+            'Non compile (raison inconnue)'
+        }
+
+        # Resultats partiels deja collectes
+        $partialResults = if ($results -and $results.Count -gt 0) {
+            $results | ForEach-Object {
+                "  $($_.Heure)  $($_.Test.PadRight(20)) [$($_.Status.PadRight(4))] $($_.Valeur)  $($_.Detail)"
+            }
+        } else { @('  (aucun resultat collecte avant le crash)') }
+
+        # Parametres passes au script
+        $paramLines = @(
+            "Tests      : $($script:testsToRun -join ', ')",
+            "Passes     : $Passes",
+            "RamSize    : $RamSize Mo",
+            "Export     : $(if ($Export) { $Export } else { '(aucun)' })",
+            "Config     : $(if ($configPath) { $configPath } else { '(defaut)' })",
+            "Watch      : $Watch",
+            "Compare    : $(if ($Compare) { $Compare } else { '(aucun)' })"
+        )
+
+        $errContent = (@(
+            "╔══════════════════════════════════════════════════════════╗",
+            "  occt81 v4.2 — CRASH REPORT",
+            "  $(Get-Date -Format 'dd/MM/yyyy HH:mm:ss')",
+            "╚══════════════════════════════════════════════════════════╝",
+            "",
+            "── MACHINE ──────────────────────────────────────────────────",
+            "Nom         : $env:COMPUTERNAME"
+        ) + $sysLines + @(
+            "",
+            "── ERREUR ───────────────────────────────────────────────────",
+            "Type        : $($_.Exception.GetType().FullName)",
+            "Message     : $($_.Exception.Message)",
+            "Position    : $($_.InvocationInfo.PositionMessage)",
+            "",
+            "Chaine d exceptions :"
+        ) + $exChain + @(
+            "",
+            "Stack PowerShell :",
+            $_.ScriptStackTrace,
+            "",
+            "── PARAMETRES ───────────────────────────────────────────────"
+        ) + $paramLines + @(
+            "",
+            "── ETAT RAMENGINE ───────────────────────────────────────────",
+            "Statut      : $ramEngineStatus",
+            "",
+            "── RESULTATS PARTIELS (avant crash) ─────────────────────────"
+        ) + $partialResults + @("")) -join "`n"
+
+        [System.IO.File]::WriteAllText($crashLog, $errContent, [System.Text.Encoding]::UTF8)
+
+        if (-not $Silent) {
+            Write-Host "`n!! ERREUR FATALE : $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "   Type     : $($_.Exception.GetType().FullName)" -ForegroundColor DarkYellow
+            Write-Host "   Position : $($_.InvocationInfo.PositionMessage)" -ForegroundColor DarkYellow
+            if ($script:RamEngineCompileError) {
+                Write-Host "   RamEngine: $script:RamEngineCompileError" -ForegroundColor DarkYellow
+            }
+            Write-Host "   Crash log: $crashLog" -ForegroundColor Cyan
+        }
+    }
+    catch { <# ne pas planter le handler de crash #> }
+    throw
+}
+finally {
+    # Cleanup OHM
+    try {
+        if ($ohmProc) {
+            if (-not $Silent) { Write-Info "Arret OHM..." -color 'DarkGray' }
+            $ohmProc.CloseMainWindow() | Out-Null
+            Start-Sleep -Seconds 1
+            if (-not $ohmProc.HasExited) { $ohmProc | Stop-Process -Force }
+        }
+        # Securite : tuer tout OHM residuel lance par ce script
+        Get-Process OpenHardwareMonitor -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    catch { <# cleanup ne doit jamais planter #> }
+}
