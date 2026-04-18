@@ -2131,12 +2131,23 @@ function Export-Report {
             ("  {0,-30} {1,-8} {2,-22} {3}" -f 'TEST','STATUT','VALEUR','DETAIL'),
             $sep
         )
-        foreach ($r in $results) {
+foreach ($r in $results) {
             $icon = switch ($r.Status) { 'OK'{'  '} 'WARN'{'!!'} 'FAIL'{'XX'} default{'  '} }
-            $n = $r.Test.TrimEnd().PadRight(30)
-            $s = ("[{0}]" -f $r.Status.PadRight(4)).PadRight(8)
-            $v = $r.Valeur.TrimEnd().PadRight(22)
-            $lines += "  $icon $n $s $v $($r.Detail.TrimEnd())"
+            $n      = $r.Test.TrimEnd().PadRight(30)
+            $s      = ("[{0}]" -f $r.Status.PadRight(4)).PadRight(8)
+            $v      = $r.Valeur.TrimEnd().PadRight(22)
+            $main   = "  $icon $n $s $v"
+            $detail = $r.Detail.TrimEnd()
+            if ($detail -eq '') {
+                $lines += $main
+            } elseif (($main.Length + 1 + $detail.Length) -le 90) {
+                $lines += "$main $detail"
+            } else {
+                $lines += $main
+                foreach ($part in ($detail -split ' \| ')) {
+                    if ($part.Trim()) { $lines += "        > $($part.Trim())" }
+                }
+            }
         }
         $lines += $sep
         $lines += $conc.Lines
