@@ -1926,32 +1926,18 @@ function Invoke-GoFileUpload {
 
         Write-Host "Upload GoFile..." -ForegroundColor Cyan -NoNewline
 
-        $boundary  = [System.Guid]::NewGuid().ToString()
-        $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
-        $fileName  = [System.IO.Path]::GetFileName($FilePath)
-        $encoding  = [System.Text.Encoding]::UTF8
+        $resp = curl.exe -s -F "file=@$FilePath" "https://upload.gofile.io/uploadfile" | ConvertFrom-Json
 
-        $bodyParts  = "--$boundary`r`n"
-        $bodyParts += "Content-Disposition: form-data; name=`"file`"; filename=`"$fileName`"`r`n"
-        $bodyParts += "Content-Type: application/octet-stream`r`n`r`n"
-        $bodyBytes  = $encoding.GetBytes($bodyParts) + $fileBytes + $encoding.GetBytes("`r`n--$boundary--`r`n")
-
-        $uploadJson = Invoke-RestMethod -Uri "https://upload.gofile.io/uploadfile" `
-                        -Method Post `
-                        -ContentType "multipart/form-data; boundary=$boundary" `
-                        -Body $bodyBytes `
-                        -ErrorAction Stop
-
-        if ($uploadJson.status -eq "ok" -and $uploadJson.data) {
-            $dl = if ($uploadJson.data.downloadPage) { $uploadJson.data.downloadPage }
-                  elseif ($uploadJson.data.code)     { "https://gofile.io/d/$($uploadJson.data.code)" }
-                  elseif ($uploadJson.data.fileId)   { "https://gofile.io/d/$($uploadJson.data.fileId)" }
-                  else { throw "Champ de lien introuvable dans la reponse" }
+        if ($resp.status -eq "ok" -and $resp.data) {
+            $dl = if ($resp.data.downloadPage) { $resp.data.downloadPage }
+                  elseif ($resp.data.code)     { "https://gofile.io/d/$($resp.data.code)" }
+                  elseif ($resp.data.fileId)   { "https://gofile.io/d/$($resp.data.fileId)" }
+                  else { throw "Lien introuvable dans la reponse" }
             Write-Host " OK" -ForegroundColor Green
             Write-Host "   LIEN GOFILE : $dl" -ForegroundColor Yellow
             return $dl
         }
-        else { throw "Upload echoue : $($uploadJson.status)" }
+        else { throw "Upload echoue : $($resp.status)" }
     }
     catch {
         Write-Warning "GoFile upload echoue : $($_.Exception.Message)"
