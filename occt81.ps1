@@ -1924,15 +1924,9 @@ function Invoke-GoFileUpload {
     try {
         if (-not (Test-Path $FilePath)) { throw "Fichier introuvable : $FilePath" }
 
-        # Utiliser Invoke-RestMethod au lieu de curl.exe (natif PS 5.1+)
-        $serverJson = Invoke-RestMethod -Uri "https://api.gofile.io/servers" -ErrorAction Stop
-        if ($serverJson.status -ne "ok") { throw "API GoFile erreur : $($serverJson.status)" }
-        $server = $serverJson.data.servers | Get-Random | Select-Object -ExpandProperty name
+        Write-Host "Upload GoFile..." -ForegroundColor Cyan -NoNewline
 
-        Write-Host "Upload GoFile (serveur: $server)..." -ForegroundColor Cyan -NoNewline
-
-        # Multipart form-data avec Invoke-RestMethod
-        $boundary = [System.Guid]::NewGuid().ToString()
+        $boundary  = [System.Guid]::NewGuid().ToString()
         $fileBytes = [System.IO.File]::ReadAllBytes($FilePath)
         $fileName  = [System.IO.Path]::GetFileName($FilePath)
         $encoding  = [System.Text.Encoding]::UTF8
@@ -1942,24 +1936,22 @@ function Invoke-GoFileUpload {
         $bodyParts += "Content-Type: application/octet-stream`r`n`r`n"
         $bodyBytes  = $encoding.GetBytes($bodyParts) + $fileBytes + $encoding.GetBytes("`r`n--$boundary--`r`n")
 
-        $uploadJson = Invoke-RestMethod -Uri "https://$server.gofile.io/contents/uploadfile" `
+        $uploadJson = Invoke-RestMethod -Uri "https://upload.gofile.io/uploadfile" `
                         -Method Post `
                         -ContentType "multipart/form-data; boundary=$boundary" `
                         -Body $bodyBytes `
                         -ErrorAction Stop
 
         if ($uploadJson.status -eq "ok" -and $uploadJson.data) {
-            $dl = if ($uploadJson.data.downloadPage)  { $uploadJson.data.downloadPage }
-                  elseif ($uploadJson.data.code)       { "https://gofile.io/d/$($uploadJson.data.code)" }
-                  elseif ($uploadJson.data.fileId)     { "https://gofile.io/d/$($uploadJson.data.fileId)" }
+            $dl = if ($uploadJson.data.downloadPage) { $uploadJson.data.downloadPage }
+                  elseif ($uploadJson.data.code)     { "https://gofile.io/d/$($uploadJson.data.code)" }
+                  elseif ($uploadJson.data.fileId)   { "https://gofile.io/d/$($uploadJson.data.fileId)" }
                   else { throw "Champ de lien introuvable dans la reponse" }
             Write-Host " OK" -ForegroundColor Green
             Write-Host "   LIEN GOFILE : $dl" -ForegroundColor Yellow
             return $dl
         }
-        else {
-            throw "Upload echoue : $($uploadJson.status)"
-        }
+        else { throw "Upload echoue : $($uploadJson.status)" }
     }
     catch {
         Write-Warning "GoFile upload echoue : $($_.Exception.Message)"
