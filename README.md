@@ -12,24 +12,11 @@ $occt = {
     Remove-Item $zip -Force -ErrorAction SilentlyContinue
 
     $dir = (Get-ChildItem $extract -Recurse -Filter "occt81.ps1" | Select-Object -First 1).Directory.FullName
-    $ohmExe = Get-ChildItem $dir -Recurse -Filter "OpenHardwareMonitor.exe" | Select-Object -First 1
-    $ohmProc = $null
-    if ($ohmExe) {
-        Write-Host "Démarrage OHM..." -ForegroundColor DarkGray
-        $ohmProc = Start-Process $ohmExe.FullName -WindowStyle Minimized -PassThru -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 3
-    }
+    Write-Host "Dossier : $dir" -ForegroundColor DarkGray
 
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
     Write-Host "Lancement occt81.ps1..." -ForegroundColor Cyan
     & (Join-Path $dir "occt81.ps1") -Export $file
-
-    if ($ohmProc -and -not $ohmProc.HasExited) {
-        $ohmProc.CloseMainWindow() | Out-Null
-        Start-Sleep -Milliseconds 800
-        if (-not $ohmProc.HasExited) { $ohmProc | Stop-Process -Force -ErrorAction SilentlyContinue }
-    }
-    Get-Process OpenHardwareMonitor -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
     Write-Host "`nDOSSIER DES OUTILS :" -ForegroundColor Cyan
     if ($env:WT_SESSION -or $env:TERM_PROGRAM -eq 'vscode') {
