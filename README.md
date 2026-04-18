@@ -16,7 +16,7 @@ $occt = {
 
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
     Write-Host "Lancement occt81.ps1..." -ForegroundColor Cyan
-    & (Join-Path $dir "occt81.ps1") -Export $file
+    & (Join-Path $dir "occt81.ps1") -Export $file -Tests Tout
 
     Write-Host "`nDOSSIER DES OUTILS :" -ForegroundColor Cyan
     if ($env:WT_SESSION -or $env:TERM_PROGRAM -eq 'vscode') {
